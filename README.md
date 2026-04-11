@@ -412,7 +412,7 @@ http://<your-host>:8000/v1
 - `csv` / `tsv` 会按行读取，并将列拼成文本
 - `xlsx` 使用 `openpyxl` 读取
 - `xls` 使用 `xlrd` 读取
-- 表格内容会按 sheet 和行展开成普通文本，再参与切块和索引
+- 表格内容会按 sheet、行号、列号展开成普通文本，再参与切块和索引
 - 可通过 `EXCEL_MAX_ROWS_PER_SHEET` 限制单个 sheet 读取的最大行数，避免超大表格拖慢索引
 
 ### Office / PDF
@@ -459,6 +459,16 @@ http://<your-host>:8000/v1
   - 单个 Excel sheet 最大读取行数
   - 超出后会截断，并写入一条 `[Truncated]` 标记
   - 用于避免超大表格显著拖慢索引
+
+- `EXCEL_MAX_COLUMNS_PER_ROW`
+  - 单行最多读取的列数
+  - 超出后会在该行末尾写入截断标记
+  - 用于限制特别宽的 sheet 带来的噪声
+
+- `EXCEL_INCLUDE_EMPTY_ROWS`
+  - 是否保留空行
+  - 默认 `false`
+  - 如果某些 sheet 依赖空行分段，可以改成 `true`
 
 ## 推荐配置
 

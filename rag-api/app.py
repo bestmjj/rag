@@ -66,6 +66,8 @@ EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", OPENAI_API_KEY)
 EMBEDDING_MODEL_REMOTE = os.getenv("EMBEDDING_MODEL_REMOTE", "text-embedding-3-small")
 PDF_EXTRACTOR = os.getenv("PDF_EXTRACTOR", "pymupdf").lower()
 EXCEL_MAX_ROWS_PER_SHEET = env_int("EXCEL_MAX_ROWS_PER_SHEET", 5000)
+EXCEL_MAX_COLUMNS_PER_ROW = env_int("EXCEL_MAX_COLUMNS_PER_ROW", 200)
+EXCEL_INCLUDE_EMPTY_ROWS = os.getenv("EXCEL_INCLUDE_EMPTY_ROWS", "false").lower() == "true"
 STATE_DIR = Path(os.getenv("STATE_DIR", "/var/lib/rag-api")).resolve()
 MANIFEST_PATH = STATE_DIR / "index_manifest.json"
 JOBS_DIR = STATE_DIR / "jobs"
@@ -757,16 +759,19 @@ def read_excel_file(path: Path) -> str:
         sheets_text = []
         try:
             for sheet in workbook.worksheets:
-                rows = []
+                rows = [f"[Sheet] {sheet.title}"]
+                rows_included = 0
                 for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-                    if row_idx > EXCEL_MAX_ROWS_PER_SHEET:
+                    if rows_included >= EXCEL_MAX_ROWS_PER_SHEET:
                         rows.append(f"[Truncated] Reached row limit: {EXCEL_MAX_ROWS_PER_SHEET}")
                         break
-                    values = [str(cell).strip() for cell in row if cell not in (None, "")]
-                    if values:
-                        rows.append(" | ".join(values))
-                if rows:
-                    sheets_text.append(f"[Sheet] {sheet.title}\n" + "\n".join(rows))
+                    line = excel_row_to_text(row_idx, row)
+                    if line is None:
+                        continue
+                    rows.append(line)
+                    rows_included += 1
+                if len(rows) > 1:
+                    sheets_text.append("\n".join(rows))
         finally:
             workbook.close()
         return normalize_text("\n\n".join(sheets_text))
@@ -778,20 +783,48 @@ def read_excel_file(path: Path) -> str:
         sheets_text = []
         for name in workbook.sheet_names():
             sheet = workbook.sheet_by_name(name)
-            rows = []
+            rows = [f"[Sheet] {name}"]
+            rows_included = 0
             for row_idx in range(sheet.nrows):
-                if row_idx >= EXCEL_MAX_ROWS_PER_SHEET:
+                if rows_included >= EXCEL_MAX_ROWS_PER_SHEET:
                     rows.append(f"[Truncated] Reached row limit: {EXCEL_MAX_ROWS_PER_SHEET}")
                     break
                 row = sheet.row_values(row_idx)
-                values = [str(cell).strip() for cell in row if str(cell).strip()]
-                if values:
-                    rows.append(" | ".join(values))
-            if rows:
-                sheets_text.append(f"[Sheet] {name}\n" + "\n".join(rows))
+                line = excel_row_to_text(row_idx + 1, row)
+                if line is None:
+                    continue
+                rows.append(line)
+                rows_included += 1
+            if len(rows) > 1:
+                sheets_text.append("\n".join(rows))
         return normalize_text("\n\n".join(sheets_text))
     finally:
         workbook.release_resources()
+
+
+def excel_row_to_text(row_number: int, row: Iterable[Any]) -> str | None:
+    values = []
+    for column_index, cell in enumerate(row, start=1):
+        if column_index > EXCEL_MAX_COLUMNS_PER_ROW:
+            values.append(f"[Truncated columns>{EXCEL_MAX_COLUMNS_PER_ROW}]")
+            break
+        text = excel_cell_to_text(cell)
+        if text:
+            values.append(f"C{column_index}:{text}")
+
+    if not values:
+        if EXCEL_INCLUDE_EMPTY_ROWS:
+            return f"R{row_number}: [Empty Row]"
+        return None
+    return f"R{row_number}: " + " | ".join(values)
+
+
+def excel_cell_to_text(cell: Any) -> str:
+    if cell is None:
+        return ""
+    if isinstance(cell, str):
+        return cell.strip()
+    return str(cell).strip()
 
 
 def read_doc_file(path: Path) -> str:
