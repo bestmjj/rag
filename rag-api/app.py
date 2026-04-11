@@ -1131,7 +1131,6 @@ def chat_completions(request: ChatCompletionRequest) -> Any:
         f"Context:\n{context if context else 'No relevant documents were found.'}"
     )
     llm_messages = [{"role": "system", "content": system_prompt}, *user_messages]
-    answer = get_chat_service().complete(llm_messages, request.temperature or 0.2)
 
     citations = []
     for match in matches:
@@ -1141,6 +1140,8 @@ def chat_completions(request: ChatCompletionRequest) -> Any:
     if request.stream:
         stream = get_chat_service().complete_stream(llm_messages, request.temperature or 0.2)
         return proxy_streaming_response(stream, model_name, citations)
+
+    answer = get_chat_service().complete(llm_messages, request.temperature or 0.2)
     if citations:
         answer = f"{answer}\n\nSources:\n" + "\n".join(dict.fromkeys(citations))
     return build_openai_response(answer, model_name)
