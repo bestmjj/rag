@@ -37,6 +37,7 @@ services:
     environment:
       # Mounted knowledge base path inside the container.
       KB_ROOT: ${KB_ROOT:-/kb}
+      STATE_DIR: ${STATE_DIR:-/var/lib/rag-api}
 
       # Supported file types and path filters.
       KB_EXTENSIONS: ${KB_EXTENSIONS:-.txt,.text,.md,.markdown,.rst,.log,.ini,.cfg,.conf,.yaml,.yml,.json,.xml,.html,.htm,.css,.js,.ts,.tsx,.jsx,.py,.go,.java,.c,.cc,.cpp,.h,.hpp,.rs,.sh,.sql,.csv,.tsv,.pdf,.doc,.docx,.xls,.xlsx}
@@ -78,5 +79,7 @@ services:
     volumes:
       # Host Kodbox storage mounted read-only into the container.
       - ${KB_HOST_PATH:-/data/kodbox/files}:${KB_ROOT:-/kb}:ro
+      # Local rag-api state, including incremental manifest cache.
+      - ${RAG_API_STATE_PATH:-./data/rag-api-state}:${STATE_DIR:-/var/lib/rag-api}
     depends_on:
       - qdrant

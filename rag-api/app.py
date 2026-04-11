@@ -1,8 +1,8 @@
 import hashlib
-import os
-import re
 import json
 import csv
+import os
+import re
 import subprocess
 import time
 import uuid
@@ -65,6 +65,8 @@ EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", OPENAI_API_KEY)
 EMBEDDING_MODEL_REMOTE = os.getenv("EMBEDDING_MODEL_REMOTE", "text-embedding-3-small")
 PDF_EXTRACTOR = os.getenv("PDF_EXTRACTOR", "pymupdf").lower()
 EXCEL_MAX_ROWS_PER_SHEET = env_int("EXCEL_MAX_ROWS_PER_SHEET", 5000)
+STATE_DIR = Path(os.getenv("STATE_DIR", "/var/lib/rag-api")).resolve()
+MANIFEST_PATH = STATE_DIR / "index_manifest.json"
 
 app = FastAPI(title="lightweight-rag-api", version="0.1.0")
 
@@ -256,32 +258,58 @@ class FileIndexer:
 
     def index(self) -> IndexResponse:
         current_files = list(self.iter_files())
-        existing = self.store.list_indexed_files()
+        manifest = load_manifest()
         current_paths = {str(path) for path in current_files}
         deleted_files = 0
         indexed_files = 0
         indexed_chunks = 0
 
-        for source_path in set(existing) - current_paths:
+        for source_path in set(manifest) - current_paths:
             self.store.delete_file(source_path)
+            manifest.pop(source_path, None)
             deleted_files += 1
 
         for path in current_files:
-            file_hash = sha256_file(path)
-            mtime = path.stat().st_mtime
-            cached = existing.get(str(path))
-            if cached and cached.get("file_hash") == file_hash and float(cached.get("mtime", 0)) == mtime:
+            stats = path.stat()
+            path_key = str(path)
+            mtime = stats.st_mtime
+            size = stats.st_size
+            cached = manifest.get(path_key)
+            if cached and float(cached.get("mtime", 0)) == mtime and int(cached.get("size", -1)) == size:
                 continue
+
+            file_hash = sha256_file(path)
+            if cached and cached.get("file_hash") == file_hash:
+                cached["mtime"] = mtime
+                cached["size"] = size
+                manifest[path_key] = cached
+                continue
+
             self.store.delete_file(str(path))
             text = read_supported_file(path)
             if not text.strip():
+                manifest[path_key] = {
+                    "mtime": mtime,
+                    "size": size,
+                    "file_hash": file_hash,
+                    "indexed": False,
+                }
                 continue
             chunks = build_chunks(path, text, file_hash, mtime)
             for start in range(0, len(chunks), INDEX_BATCH_SIZE):
                 batch = chunks[start : start + INDEX_BATCH_SIZE]
                 self.store.upsert_chunks(batch)
+            manifest[path_key] = {
+                "mtime": mtime,
+                "size": size,
+                "file_hash": file_hash,
+                "indexed": True,
+                "chunks": len(chunks),
+            }
             indexed_files += 1
             indexed_chunks += len(chunks)
+
+        save_manifest(manifest)
 
         return IndexResponse(
             indexed_files=indexed_files,
@@ -345,6 +373,23 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def load_manifest() -> dict[str, dict[str, Any]]:
+    if not MANIFEST_PATH.exists():
+        return {}
+    try:
+        return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_manifest(manifest: dict[str, dict[str, Any]]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    MANIFEST_PATH.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def normalize_text(text: str) -> str:
