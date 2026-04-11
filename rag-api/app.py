@@ -289,7 +289,9 @@ class VectorStore:
                     "score": point.score,
                     "text": payload.get("text", ""),
                     "source_path": payload.get("source_path", ""),
+                    "source_ref": payload.get("source_ref", payload.get("source_path", "")),
                     "file_name": payload.get("file_name", ""),
+                    "sheet_name": payload.get("sheet_name", ""),
                     "chunk_index": payload.get("chunk_index", 0),
                 }
             )
@@ -767,11 +769,11 @@ def read_delimited_file(path: Path) -> str:
     return normalize_text("\n".join(rows))
 
 
-def read_excel_file(path: Path) -> str:
+def read_excel_sheet_texts(path: Path) -> list[dict[str, str]]:
     suffix = path.suffix.lower()
+    sheets_text = []
     if suffix == ".xlsx":
         workbook = load_workbook(filename=str(path), read_only=True, data_only=True)
-        sheets_text = []
         try:
             for sheet in workbook.worksheets:
                 rows = [f"[Sheet] {sheet.title}"]
@@ -786,16 +788,15 @@ def read_excel_file(path: Path) -> str:
                     rows.append(line)
                     rows_included += 1
                 if len(rows) > 1:
-                    sheets_text.append("\n".join(rows))
+                    sheets_text.append({"title": sheet.title, "text": normalize_text("\n".join(rows))})
         finally:
             workbook.close()
-        return normalize_text("\n\n".join(sheets_text))
+        return sheets_text
 
     import xlrd
 
     workbook = xlrd.open_workbook(str(path), on_demand=True)
     try:
-        sheets_text = []
         for name in workbook.sheet_names():
             sheet = workbook.sheet_by_name(name)
             rows = [f"[Sheet] {name}"]
@@ -811,10 +812,14 @@ def read_excel_file(path: Path) -> str:
                 rows.append(line)
                 rows_included += 1
             if len(rows) > 1:
-                sheets_text.append("\n".join(rows))
-        return normalize_text("\n\n".join(sheets_text))
+                sheets_text.append({"title": name, "text": normalize_text("\n".join(rows))})
+        return sheets_text
     finally:
         workbook.release_resources()
+
+
+def read_excel_file(path: Path) -> str:
+    return normalize_text("\n\n".join(sheet["text"] for sheet in read_excel_sheet_texts(path)))
 
 
 def excel_row_to_text(row_number: int, row: Iterable[Any]) -> str | None:
@@ -901,6 +906,28 @@ def split_text(text: str) -> list[str]:
 def build_chunks(path: Path, text: str, file_hash: str, mtime: float) -> list[Chunk]:
     chunks = []
     rel_name = path.name
+    if path.suffix.lower() in {".xls", ".xlsx"}:
+        for sheet in read_excel_sheet_texts(path):
+            sheet_title = sheet["title"]
+            source_ref = f"{path} [Sheet: {sheet_title}]"
+            for index, chunk_text in enumerate(split_text(sheet["text"])):
+                chunks.append(
+                    Chunk(
+                        id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{path}:{sheet_title}:{index}:{file_hash}")),
+                        text=chunk_text,
+                        payload={
+                            "source_path": str(path),
+                            "source_ref": source_ref,
+                            "sheet_name": sheet_title,
+                            "file_name": rel_name,
+                            "chunk_index": index,
+                            "file_hash": file_hash,
+                            "mtime": mtime,
+                        },
+                    )
+                )
+        return chunks
+
     for index, chunk_text in enumerate(split_text(text)):
         chunks.append(
             Chunk(
@@ -908,6 +935,7 @@ def build_chunks(path: Path, text: str, file_hash: str, mtime: float) -> list[Ch
                 text=chunk_text,
                 payload={
                     "source_path": str(path),
+                    "source_ref": str(path),
                     "file_name": rel_name,
                     "chunk_index": index,
                     "file_hash": file_hash,
@@ -1052,7 +1080,7 @@ def build_context(matches: list[dict[str, Any]]) -> str:
     sections = []
     current_size = 0
     for idx, match in enumerate(matches, start=1):
-        section = f"[Source {idx}]\nPath: {match['source_path']}\nChunk: {match['chunk_index']}\nContent:\n{match['text']}"
+        section = f"[Source {idx}]\nPath: {match.get('source_ref') or match['source_path']}\nChunk: {match['chunk_index']}\nContent:\n{match['text']}"
         if current_size + len(section) > MAX_CONTEXT_CHARS and sections:
             break
         sections.append(section)
@@ -1066,7 +1094,7 @@ def select_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for match in matches:
         if match.get("score", 0.0) < MIN_RETRIEVAL_SCORE:
             continue
-        key = (match.get("source_path"), match.get("chunk_index"))
+        key = (match.get("source_ref") or match.get("source_path"), match.get("chunk_index"))
         if key in seen:
             continue
         seen.add(key)
@@ -1149,7 +1177,7 @@ def chat_completions(request: ChatCompletionRequest) -> Any:
 
     citations = []
     for match in matches:
-        citations.append(f"- {match['source_path']}")
+        citations.append(f"- {match.get('source_ref') or match['source_path']}")
 
     model_name = request.model or CHAT_MODEL or "rag-model"
     if request.stream:
