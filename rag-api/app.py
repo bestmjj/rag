@@ -68,6 +68,7 @@ PDF_EXTRACTOR = os.getenv("PDF_EXTRACTOR", "pymupdf").lower()
 EXCEL_MAX_ROWS_PER_SHEET = env_int("EXCEL_MAX_ROWS_PER_SHEET", 5000)
 STATE_DIR = Path(os.getenv("STATE_DIR", "/var/lib/rag-api")).resolve()
 MANIFEST_PATH = STATE_DIR / "index_manifest.json"
+JOBS_DIR = STATE_DIR / "jobs"
 
 app = FastAPI(title="lightweight-rag-api", version="0.1.0")
 
@@ -110,6 +111,7 @@ class IndexJobStatus(BaseModel):
     started_at: float | None = None
     finished_at: float | None = None
     error: str | None = None
+    progress: dict[str, Any] | None = None
     result: IndexResponse | None = None
 
 
@@ -281,7 +283,7 @@ class FileIndexer:
     def __init__(self, store: VectorStore) -> None:
         self.store = store
 
-    def index(self) -> IndexResponse:
+    def index(self, progress_callback: Any = None) -> IndexResponse:
         started_at = time.time()
         total_started = time.perf_counter()
         timings = init_timings()
@@ -300,6 +302,18 @@ class FileIndexer:
         indexed_chunks = 0
         skipped_files = 0
 
+        report_index_progress(
+            progress_callback,
+            phase="scan",
+            scanned_files=len(current_files),
+            indexed_files=indexed_files,
+            deleted_files=deleted_files,
+            indexed_chunks=indexed_chunks,
+            skipped_files=skipped_files,
+            current_file=None,
+            timings=round_timings(timings),
+        )
+
         for source_path in set(manifest) - current_paths:
             delete_started = time.perf_counter()
             self.store.delete_file(source_path)
@@ -307,7 +321,19 @@ class FileIndexer:
             manifest.pop(source_path, None)
             deleted_files += 1
 
-        for path in current_files:
+            report_index_progress(
+                progress_callback,
+                phase="delete",
+                scanned_files=len(current_files),
+                indexed_files=indexed_files,
+                deleted_files=deleted_files,
+                indexed_chunks=indexed_chunks,
+                skipped_files=skipped_files,
+                current_file=source_path,
+                timings=round_timings(timings),
+            )
+
+        for file_number, path in enumerate(current_files, start=1):
             stat_started = time.perf_counter()
             stats = path.stat()
             path_key = str(path)
@@ -318,6 +344,18 @@ class FileIndexer:
             cached = manifest.get(path_key)
             if cached and float(cached.get("mtime", 0)) == mtime and int(cached.get("size", -1)) == size:
                 skipped_files += 1
+                report_index_progress(
+                    progress_callback,
+                    phase="skip",
+                    scanned_files=len(current_files),
+                    indexed_files=indexed_files,
+                    deleted_files=deleted_files,
+                    indexed_chunks=indexed_chunks,
+                    skipped_files=skipped_files,
+                    current_file=path_key,
+                    current_index=file_number,
+                    timings=round_timings(timings),
+                )
                 continue
 
             hash_started = time.perf_counter()
@@ -328,6 +366,18 @@ class FileIndexer:
                 cached["size"] = size
                 manifest[path_key] = cached
                 skipped_files += 1
+                report_index_progress(
+                    progress_callback,
+                    phase="skip",
+                    scanned_files=len(current_files),
+                    indexed_files=indexed_files,
+                    deleted_files=deleted_files,
+                    indexed_chunks=indexed_chunks,
+                    skipped_files=skipped_files,
+                    current_file=path_key,
+                    current_index=file_number,
+                    timings=round_timings(timings),
+                )
                 continue
 
             delete_started = time.perf_counter()
@@ -345,6 +395,18 @@ class FileIndexer:
                     "indexed": False,
                 }
                 skipped_files += 1
+                report_index_progress(
+                    progress_callback,
+                    phase="read",
+                    scanned_files=len(current_files),
+                    indexed_files=indexed_files,
+                    deleted_files=deleted_files,
+                    indexed_chunks=indexed_chunks,
+                    skipped_files=skipped_files,
+                    current_file=path_key,
+                    current_index=file_number,
+                    timings=round_timings(timings),
+                )
                 continue
 
             chunk_started = time.perf_counter()
@@ -369,12 +431,25 @@ class FileIndexer:
             indexed_files += 1
             indexed_chunks += len(chunks)
 
+            report_index_progress(
+                progress_callback,
+                phase="write",
+                scanned_files=len(current_files),
+                indexed_files=indexed_files,
+                deleted_files=deleted_files,
+                indexed_chunks=indexed_chunks,
+                skipped_files=skipped_files,
+                current_file=path_key,
+                current_index=file_number,
+                timings=round_timings(timings),
+            )
+
         manifest_save_started = time.perf_counter()
         save_manifest(manifest)
         timings["manifest_save_seconds"] += time.perf_counter() - manifest_save_started
         timings["total_seconds"] = time.perf_counter() - total_started
 
-        return IndexResponse(
+        result = IndexResponse(
             status="completed",
             indexed_files=indexed_files,
             deleted_files=deleted_files,
@@ -385,6 +460,19 @@ class FileIndexer:
             finished_at=time.time(),
             timings=round_timings(timings),
         )
+        report_index_progress(
+            progress_callback,
+            phase="completed",
+            scanned_files=len(current_files),
+            indexed_files=indexed_files,
+            deleted_files=deleted_files,
+            indexed_chunks=indexed_chunks,
+            skipped_files=skipped_files,
+            current_file=None,
+            current_index=len(current_files),
+            timings=result.timings,
+        )
+        return result
 
     def iter_files(self) -> Iterable[Path]:
         if not KB_ROOT.exists():
@@ -464,6 +552,40 @@ def save_manifest(manifest: dict[str, dict[str, Any]]) -> None:
     )
 
 
+def job_status_path(job_id: str) -> Path:
+    return JOBS_DIR / f"{job_id}.json"
+
+
+def save_job_status(job: IndexJobStatus) -> None:
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    job_status_path(job.job_id).write_text(
+        job.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_job_status(job_id: str) -> IndexJobStatus | None:
+    path = job_status_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        return IndexJobStatus.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def load_job_statuses() -> list[IndexJobStatus]:
+    if not JOBS_DIR.exists():
+        return []
+    jobs = []
+    for path in sorted(JOBS_DIR.glob("*.json")):
+        try:
+            jobs.append(IndexJobStatus.model_validate_json(path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return jobs
+
+
 def init_timings() -> dict[str, float]:
     return {
         "scan_seconds": 0.0,
@@ -484,10 +606,18 @@ def round_timings(timings: dict[str, float]) -> dict[str, float]:
     return {key: round(value, 6) for key, value in timings.items()}
 
 
+def report_index_progress(progress_callback: Any, **progress: Any) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(progress)
+
+
 def list_index_jobs() -> list[IndexJobStatus]:
     with index_jobs_lock:
-        jobs = list(index_jobs.values())
-    return sorted(jobs, key=lambda job: job.started_at or 0.0, reverse=True)
+        jobs = {job.job_id: job for job in index_jobs.values()}
+    for job in load_job_statuses():
+        jobs[job.job_id] = job
+    return sorted(jobs.values(), key=lambda job: job.started_at or 0.0, reverse=True)
 
 
 def get_active_index_job() -> IndexJobStatus | None:
@@ -504,17 +634,35 @@ def run_index_job(job_id: str) -> None:
             job.status = "running"
             job.started_at = time.time()
             index_jobs[job_id] = job
+            save_job_status(job)
+
+        def progress_callback(progress: dict[str, Any]) -> None:
+            with index_jobs_lock:
+                current = index_jobs[job_id]
+                current.progress = progress
+                index_jobs[job_id] = current
+                save_job_status(current)
 
         try:
-            result = get_indexer().index()
+            result = get_indexer().index(progress_callback=progress_callback)
             with index_jobs_lock:
                 index_jobs[job_id] = IndexJobStatus(
                     job_id=job_id,
                     status="completed",
                     started_at=job.started_at,
                     finished_at=time.time(),
+                    progress={
+                        "phase": "completed",
+                        "scanned_files": result.scanned_files,
+                        "indexed_files": result.indexed_files,
+                        "deleted_files": result.deleted_files,
+                        "indexed_chunks": result.indexed_chunks,
+                        "skipped_files": result.skipped_files,
+                        "timings": result.timings,
+                    },
                     result=result,
                 )
+                save_job_status(index_jobs[job_id])
         except Exception as exc:
             with index_jobs_lock:
                 index_jobs[job_id] = IndexJobStatus(
@@ -523,7 +671,9 @@ def run_index_job(job_id: str) -> None:
                     started_at=job.started_at,
                     finished_at=time.time(),
                     error=str(exc),
+                    progress=getattr(index_jobs.get(job_id), "progress", None),
                 )
+                save_job_status(index_jobs[job_id])
 
 
 def normalize_text(text: str) -> str:
@@ -896,6 +1046,7 @@ def run_index_async() -> IndexJobStatus:
     job = IndexJobStatus(job_id=job_id, status="queued")
     with index_jobs_lock:
         index_jobs[job_id] = job
+        save_job_status(job)
 
     thread = threading.Thread(target=run_index_job, args=(job_id,), daemon=True)
     thread.start()
@@ -911,6 +1062,8 @@ def get_index_jobs() -> list[IndexJobStatus]:
 def get_index_job(job_id: str) -> IndexJobStatus:
     with index_jobs_lock:
         job = index_jobs.get(job_id)
+    if job is None:
+        job = load_job_status(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="index job not found")
     return job

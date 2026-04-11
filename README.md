@@ -145,6 +145,14 @@ EMBEDDING_MODEL_REMOTE=text-embedding-3-small
 docker compose up -d --build
 ```
 
+默认还会启动一个轻量定时调度容器 `rag-index-scheduler`，它会按固定间隔调用：
+
+```text
+POST /index/async
+```
+
+如果当前已有索引任务正在运行，接口会返回 `409`，调度器会忽略这次冲突并等待下一轮。
+
 ### 3. 手动触发索引
 
 ```bash
@@ -181,6 +189,7 @@ http://<your-host>:8000/v1
 - `POST /index/async`
   - 创建后台索引任务
   - 如果已有任务正在执行，会返回 `409`
+  - 任务状态会持续写入 `STATE_DIR/jobs/<job_id>.json`
 
 - `GET /index/jobs`
   - 列出索引任务
@@ -251,6 +260,7 @@ http://<your-host>:8000/v1
 - `STATE_DIR`
   - `rag-api` 的本地状态目录
   - 用于保存增量索引 manifest 缓存
+  - 也用于保存异步索引任务状态文件
   - 建议挂载成持久化目录，否则容器重建后会失去增量缓存
 
 - `KB_EXTENSIONS`
@@ -437,6 +447,14 @@ http://<your-host>:8000/v1
 - `RESTART_POLICY`
   - Docker 重启策略
 
+- `RAG_INDEX_SCHEDULER_CONTAINER_NAME`
+  - 定时索引调度容器名
+
+- `INDEX_SCHEDULE_INTERVAL_SECONDS`
+  - 定时触发异步索引的间隔秒数
+  - 默认 `600`，即每 10 分钟尝试触发一次
+  - 如果上一次索引仍在执行，这一轮会被自动跳过
+
 - `EXCEL_MAX_ROWS_PER_SHEET`
   - 单个 Excel sheet 最大读取行数
   - 超出后会截断，并写入一条 `[Truncated]` 标记
@@ -556,6 +574,8 @@ curl -X POST http://127.0.0.1:8000/index
 
 所以这里没有单独的“增量接口”，重复调用 `/index` 就是增量同步。
 
+如果启用了默认的 `rag-index-scheduler` 服务，则无需手工频繁调用接口。调度器会周期性调用 `/index/async`，由 `rag-api` 在后台执行增量更新。
+
 当前实现还会在 `STATE_DIR` 下保存一个本地 manifest，用于记录：
 
 - 文件路径
@@ -565,6 +585,18 @@ curl -X POST http://127.0.0.1:8000/index
 - 上次是否成功索引
 
 这样在文件没有变化时，后续再次执行 `/index` 不需要再重新计算所有文件 hash，也不需要再从 Qdrant 全量扫描已索引文件，速度会明显更快。
+
+异步索引任务还会在 `STATE_DIR/jobs/` 下持续写入状态文件，例如：
+
+```text
+STATE_DIR/
+├── index_manifest.json
+└── jobs/
+    ├── index-aaa.json
+    └── index-bbb.json
+```
+
+这些任务状态文件会在执行过程中持续更新，因此即使容器异常退出，你仍然可以看到最后一次落盘的阶段、计数和耗时。
 
 同步索引返回示例：
 
@@ -646,6 +678,27 @@ curl -X POST http://127.0.0.1:8000/index
 }
 ```
 
+`progress` 字段会在任务执行过程中不断更新，通常包含：
+
+- `phase`
+  - 当前阶段，如 `scan`、`skip`、`read`、`write`、`delete`、`completed`
+- `current_file`
+  - 当前正在处理的文件路径
+- `current_index`
+  - 当前处理到第几个文件
+- `scanned_files`
+  - 扫描到的文件总数
+- `indexed_files`
+  - 已完成重建索引的文件数
+- `deleted_files`
+  - 已删除清理的文件数
+- `indexed_chunks`
+  - 已生成的 chunk 数
+- `skipped_files`
+  - 已跳过文件数
+- `timings`
+  - 截止当前阶段的累计耗时
+
 任务状态说明：
 
 - `queued`
@@ -726,7 +779,7 @@ curl -X POST http://127.0.0.1:8000/index
 ## 当前实现的局限
 
 - 还没有“是否需要检索”的智能门控
-- 当前异步索引基于进程内线程，容器重启后任务状态不会恢复
+- 当前异步索引基于进程内线程，容器重启后运行中的任务不会恢复，但已落盘的任务状态文件仍可查看
 - 还没有分布式任务队列
 - 还没有多知识库、多租户隔离能力
 

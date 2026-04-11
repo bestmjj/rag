@@ -83,3 +83,22 @@ services:
       - ${RAG_API_STATE_PATH:-./data/rag-api-state}:${STATE_DIR:-/var/lib/rag-api}
     depends_on:
       - qdrant
+
+  rag-index-scheduler:
+    # Lightweight polling scheduler that periodically triggers async indexing.
+    image: curlimages/curl:8.12.1
+    container_name: ${RAG_INDEX_SCHEDULER_CONTAINER_NAME:-rag-index-scheduler}
+    restart: ${RESTART_POLICY:-unless-stopped}
+    environment:
+      # Interval in seconds between async index trigger attempts.
+      INDEX_SCHEDULE_INTERVAL_SECONDS: ${INDEX_SCHEDULE_INTERVAL_SECONDS:-600}
+    command:
+      - sh
+      - -c
+      - >-
+        while true; do
+          curl -fsS -X POST http://rag-api:8000/index/async || true;
+          sleep "$${INDEX_SCHEDULE_INTERVAL_SECONDS}";
+        done
+    depends_on:
+      - rag-api
