@@ -288,6 +288,14 @@ http://<your-host>:8000/v1
   - 更大通常更快，但也更吃内存
   - 建议：`64-128`
 
+- `QDRANT_UPSERT_RETRIES`
+  - 写入 Qdrant 失败时的最大重试次数
+  - 用于降低长时间全量重建时偶发连接断开的影响
+
+- `QDRANT_UPSERT_RETRY_DELAY_SECONDS`
+  - Qdrant 写入重试的初始等待秒数
+  - 后续重试会按指数退避递增
+
 - `CHUNK_SIZE`
   - 每个 chunk 的文本长度
   - 太小会导致 chunk 数暴涨，索引变慢

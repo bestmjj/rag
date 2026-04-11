@@ -48,6 +48,8 @@ KB_EXCLUDE_PATTERNS = [
 ]
 INDEX_BATCH_SIZE = env_int("INDEX_BATCH_SIZE", 32)
 EMBEDDING_BATCH_SIZE = env_int("EMBEDDING_BATCH_SIZE", 128)
+QDRANT_UPSERT_RETRIES = env_int("QDRANT_UPSERT_RETRIES", 4)
+QDRANT_UPSERT_RETRY_DELAY_SECONDS = float(os.getenv("QDRANT_UPSERT_RETRY_DELAY_SECONDS", "2.0"))
 CHUNK_SIZE = env_int("CHUNK_SIZE", 700)
 CHUNK_OVERLAP = env_int("CHUNK_OVERLAP", 100)
 RETRIEVAL_LIMIT = env_int("RETRIEVAL_LIMIT", 4)
@@ -218,7 +220,20 @@ class VectorStore:
     def write_points(self, points: list[qmodels.PointStruct]) -> None:
         if not points:
             return
-        self.client.upsert(collection_name=QDRANT_COLLECTION, points=points)
+        retry_delay = QDRANT_UPSERT_RETRY_DELAY_SECONDS
+        last_error = None
+        for attempt in range(1, QDRANT_UPSERT_RETRIES + 1):
+            try:
+                self.client.upsert(collection_name=QDRANT_COLLECTION, points=points)
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt >= QDRANT_UPSERT_RETRIES:
+                    break
+                time.sleep(retry_delay)
+                retry_delay *= 2
+        if last_error is not None:
+            raise last_error
 
     def upsert_chunks(self, chunks: list[Chunk]) -> None:
         self.write_points(self.build_points(chunks))
