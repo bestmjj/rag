@@ -4,9 +4,10 @@ import csv
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -91,9 +92,25 @@ class ChatCompletionRequest(BaseModel):
 
 
 class IndexResponse(BaseModel):
+    status: str = "completed"
+    job_id: str | None = None
     indexed_files: int
     deleted_files: int
     indexed_chunks: int
+    scanned_files: int = 0
+    skipped_files: int = 0
+    started_at: float | None = None
+    finished_at: float | None = None
+    timings: dict[str, float] = {}
+
+
+class IndexJobStatus(BaseModel):
+    job_id: str
+    status: str
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+    result: IndexResponse | None = None
 
 
 class EmbeddingService:
@@ -178,9 +195,9 @@ class VectorStore:
             ),
         )
 
-    def upsert_chunks(self, chunks: list[Chunk]) -> None:
+    def build_points(self, chunks: list[Chunk]) -> list[qmodels.PointStruct]:
         if not chunks:
-            return
+            return []
         points = []
         texts = [chunk.text for chunk in chunks]
         vectors = self.embedder.embed(texts)
@@ -192,7 +209,15 @@ class VectorStore:
                     payload={**chunk.payload, "text": chunk.text},
                 )
             )
+        return points
+
+    def write_points(self, points: list[qmodels.PointStruct]) -> None:
+        if not points:
+            return
         self.client.upsert(collection_name=QDRANT_COLLECTION, points=points)
+
+    def upsert_chunks(self, chunks: list[Chunk]) -> None:
+        self.write_points(self.build_points(chunks))
 
     def delete_file(self, file_path: str) -> None:
         self.client.delete(
@@ -257,36 +282,61 @@ class FileIndexer:
         self.store = store
 
     def index(self) -> IndexResponse:
+        started_at = time.time()
+        total_started = time.perf_counter()
+        timings = init_timings()
+
+        scan_started = time.perf_counter()
         current_files = list(self.iter_files())
+        timings["scan_seconds"] += time.perf_counter() - scan_started
+
+        manifest_started = time.perf_counter()
         manifest = load_manifest()
+        timings["manifest_load_seconds"] += time.perf_counter() - manifest_started
+
         current_paths = {str(path) for path in current_files}
         deleted_files = 0
         indexed_files = 0
         indexed_chunks = 0
+        skipped_files = 0
 
         for source_path in set(manifest) - current_paths:
+            delete_started = time.perf_counter()
             self.store.delete_file(source_path)
+            timings["delete_seconds"] += time.perf_counter() - delete_started
             manifest.pop(source_path, None)
             deleted_files += 1
 
         for path in current_files:
+            stat_started = time.perf_counter()
             stats = path.stat()
             path_key = str(path)
             mtime = stats.st_mtime
             size = stats.st_size
+            timings["stat_seconds"] += time.perf_counter() - stat_started
+
             cached = manifest.get(path_key)
             if cached and float(cached.get("mtime", 0)) == mtime and int(cached.get("size", -1)) == size:
+                skipped_files += 1
                 continue
 
+            hash_started = time.perf_counter()
             file_hash = sha256_file(path)
+            timings["hash_seconds"] += time.perf_counter() - hash_started
             if cached and cached.get("file_hash") == file_hash:
                 cached["mtime"] = mtime
                 cached["size"] = size
                 manifest[path_key] = cached
+                skipped_files += 1
                 continue
 
+            delete_started = time.perf_counter()
             self.store.delete_file(str(path))
+            timings["delete_seconds"] += time.perf_counter() - delete_started
+
+            read_started = time.perf_counter()
             text = read_supported_file(path)
+            timings["read_seconds"] += time.perf_counter() - read_started
             if not text.strip():
                 manifest[path_key] = {
                     "mtime": mtime,
@@ -294,11 +344,21 @@ class FileIndexer:
                     "file_hash": file_hash,
                     "indexed": False,
                 }
+                skipped_files += 1
                 continue
+
+            chunk_started = time.perf_counter()
             chunks = build_chunks(path, text, file_hash, mtime)
+            timings["chunk_seconds"] += time.perf_counter() - chunk_started
             for start in range(0, len(chunks), INDEX_BATCH_SIZE):
                 batch = chunks[start : start + INDEX_BATCH_SIZE]
-                self.store.upsert_chunks(batch)
+                embed_started = time.perf_counter()
+                points = self.store.build_points(batch)
+                timings["embed_seconds"] += time.perf_counter() - embed_started
+
+                write_started = time.perf_counter()
+                self.store.write_points(points)
+                timings["write_seconds"] += time.perf_counter() - write_started
             manifest[path_key] = {
                 "mtime": mtime,
                 "size": size,
@@ -309,12 +369,21 @@ class FileIndexer:
             indexed_files += 1
             indexed_chunks += len(chunks)
 
+        manifest_save_started = time.perf_counter()
         save_manifest(manifest)
+        timings["manifest_save_seconds"] += time.perf_counter() - manifest_save_started
+        timings["total_seconds"] = time.perf_counter() - total_started
 
         return IndexResponse(
+            status="completed",
             indexed_files=indexed_files,
             deleted_files=deleted_files,
             indexed_chunks=indexed_chunks,
+            scanned_files=len(current_files),
+            skipped_files=skipped_files,
+            started_at=started_at,
+            finished_at=time.time(),
+            timings=round_timings(timings),
         )
 
     def iter_files(self) -> Iterable[Path]:
@@ -337,6 +406,9 @@ embedder: EmbeddingService | None = None
 store: VectorStore | None = None
 indexer: FileIndexer | None = None
 chat_service: ChatService | None = None
+index_jobs: dict[str, IndexJobStatus] = {}
+index_jobs_lock = threading.Lock()
+index_run_lock = threading.Lock()
 
 
 def get_embedder() -> EmbeddingService:
@@ -390,6 +462,68 @@ def save_manifest(manifest: dict[str, dict[str, Any]]) -> None:
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+
+
+def init_timings() -> dict[str, float]:
+    return {
+        "scan_seconds": 0.0,
+        "manifest_load_seconds": 0.0,
+        "stat_seconds": 0.0,
+        "hash_seconds": 0.0,
+        "delete_seconds": 0.0,
+        "read_seconds": 0.0,
+        "chunk_seconds": 0.0,
+        "embed_seconds": 0.0,
+        "write_seconds": 0.0,
+        "manifest_save_seconds": 0.0,
+        "total_seconds": 0.0,
+    }
+
+
+def round_timings(timings: dict[str, float]) -> dict[str, float]:
+    return {key: round(value, 6) for key, value in timings.items()}
+
+
+def list_index_jobs() -> list[IndexJobStatus]:
+    with index_jobs_lock:
+        jobs = list(index_jobs.values())
+    return sorted(jobs, key=lambda job: job.started_at or 0.0, reverse=True)
+
+
+def get_active_index_job() -> IndexJobStatus | None:
+    for job in list_index_jobs():
+        if job.status == "running":
+            return job
+    return None
+
+
+def run_index_job(job_id: str) -> None:
+    with index_run_lock:
+        with index_jobs_lock:
+            job = index_jobs[job_id]
+            job.status = "running"
+            job.started_at = time.time()
+            index_jobs[job_id] = job
+
+        try:
+            result = get_indexer().index()
+            with index_jobs_lock:
+                index_jobs[job_id] = IndexJobStatus(
+                    job_id=job_id,
+                    status="completed",
+                    started_at=job.started_at,
+                    finished_at=time.time(),
+                    result=result,
+                )
+        except Exception as exc:
+            with index_jobs_lock:
+                index_jobs[job_id] = IndexJobStatus(
+                    job_id=job_id,
+                    status="failed",
+                    started_at=job.started_at,
+                    finished_at=time.time(),
+                    error=str(exc),
+                )
 
 
 def normalize_text(text: str) -> str:
@@ -750,6 +884,36 @@ def health() -> dict[str, str]:
 @app.post("/index", response_model=IndexResponse)
 def run_index() -> IndexResponse:
     return get_indexer().index()
+
+
+@app.post("/index/async", response_model=IndexJobStatus)
+def run_index_async() -> IndexJobStatus:
+    active_job = get_active_index_job()
+    if active_job is not None:
+        raise HTTPException(status_code=409, detail=f"index job already running: {active_job.job_id}")
+
+    job_id = f"index-{uuid.uuid4().hex}"
+    job = IndexJobStatus(job_id=job_id, status="queued")
+    with index_jobs_lock:
+        index_jobs[job_id] = job
+
+    thread = threading.Thread(target=run_index_job, args=(job_id,), daemon=True)
+    thread.start()
+    return job
+
+
+@app.get("/index/jobs", response_model=list[IndexJobStatus])
+def get_index_jobs() -> list[IndexJobStatus]:
+    return list_index_jobs()
+
+
+@app.get("/index/jobs/{job_id}", response_model=IndexJobStatus)
+def get_index_job(job_id: str) -> IndexJobStatus:
+    with index_jobs_lock:
+        job = index_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="index job not found")
+    return job
 
 
 @app.get("/v1/models")

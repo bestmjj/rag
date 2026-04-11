@@ -53,10 +53,16 @@
 
 ### 1. 建库 / 增量索引
 
-调用：
+同步调用：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/index
+```
+
+异步调用：
+
+```bash
+curl -X POST http://127.0.0.1:8000/index/async
 ```
 
 流程：
@@ -170,6 +176,17 @@ http://<your-host>:8000/v1
 - `POST /index`
   - 触发一次全量扫描 + 增量更新
   - 同时处理新增、修改、删除
+  - 同步返回本次索引结果和阶段耗时
+
+- `POST /index/async`
+  - 创建后台索引任务
+  - 如果已有任务正在执行，会返回 `409`
+
+- `GET /index/jobs`
+  - 列出索引任务
+
+- `GET /index/jobs/{job_id}`
+  - 查看单个索引任务状态、错误和结果
 
 - `GET /v1/models`
   - 返回一个供 OpenWebUI 识别的模型列表
@@ -549,6 +566,97 @@ curl -X POST http://127.0.0.1:8000/index
 
 这样在文件没有变化时，后续再次执行 `/index` 不需要再重新计算所有文件 hash，也不需要再从 Qdrant 全量扫描已索引文件，速度会明显更快。
 
+同步索引返回示例：
+
+```json
+{
+  "status": "completed",
+  "job_id": null,
+  "indexed_files": 1,
+  "deleted_files": 0,
+  "indexed_chunks": 1130,
+  "scanned_files": 2,
+  "skipped_files": 1,
+  "started_at": 1775800000.123,
+  "finished_at": 1775800145.456,
+  "timings": {
+    "scan_seconds": 0.012,
+    "manifest_load_seconds": 0.001,
+    "stat_seconds": 0.002,
+    "hash_seconds": 1.732,
+    "delete_seconds": 0.124,
+    "read_seconds": 14.991,
+    "chunk_seconds": 0.014,
+    "embed_seconds": 102.554,
+    "write_seconds": 5.281,
+    "manifest_save_seconds": 0.003,
+    "total_seconds": 124.889
+  }
+}
+```
+
+耗时字段说明：
+
+- `scan_seconds`
+  - 扫描知识库目录
+- `manifest_load_seconds`
+  - 读取本地 manifest
+- `stat_seconds`
+  - 读取文件元信息
+- `hash_seconds`
+  - 计算变化文件 hash
+- `delete_seconds`
+  - 删除旧向量
+- `read_seconds`
+  - 读取和提取文本
+- `chunk_seconds`
+  - 文本切块
+- `embed_seconds`
+  - 生成 embedding
+- `write_seconds`
+  - 写入 Qdrant
+- `manifest_save_seconds`
+  - 保存 manifest
+- `total_seconds`
+  - 总耗时
+
+异步任务示例：
+
+```json
+{
+  "job_id": "index-1234567890abcdef",
+  "status": "completed",
+  "started_at": 1775800000.123,
+  "finished_at": 1775800145.456,
+  "error": null,
+  "result": {
+    "status": "completed",
+    "job_id": null,
+    "indexed_files": 1,
+    "deleted_files": 0,
+    "indexed_chunks": 1130,
+    "scanned_files": 2,
+    "skipped_files": 1,
+    "started_at": 1775800000.123,
+    "finished_at": 1775800145.456,
+    "timings": {
+      "total_seconds": 124.889
+    }
+  }
+}
+```
+
+任务状态说明：
+
+- `queued`
+  - 已创建，等待执行
+- `running`
+  - 正在执行
+- `completed`
+  - 执行成功
+- `failed`
+  - 执行失败，可查看 `error`
+
 ## 故障影响
 
 ### 如果下游 chat model 挂了
@@ -618,14 +726,13 @@ curl -X POST http://127.0.0.1:8000/index
 ## 当前实现的局限
 
 - 还没有“是否需要检索”的智能门控
-- `/index` 是同步接口，大目录下会阻塞较久
-- 还没有后台任务队列或索引状态查询接口
+- 当前异步索引基于进程内线程，容器重启后任务状态不会恢复
+- 还没有分布式任务队列
 - 还没有多知识库、多租户隔离能力
 
 ## 后续可优化方向
 
 - 增加“普通闲聊直连模型，知识问题才检索”的门控
-- 增加后台异步索引任务
-- 增加索引 manifest，减少每次扫描时的额外开销
+- 增加可持久化的后台任务队列
 - 针对不同文件类型使用不同 chunk 策略
 - 增加备用下游模型地址，降低单点故障影响
