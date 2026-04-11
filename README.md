@@ -329,6 +329,12 @@ http://<your-host>:8000/v1
   - 太大回答会更慢
   - 简洁型问答建议：`256-512`
 
+- `DEBUG`
+  - 是否输出详细检索调试日志
+  - 默认：`false`
+  - 设为 `true` 后，会打印 `normalized_query`、`vector_matches`、`filename_matches`、`raw_matches`、`selected_matches`
+  - 适合排查“文件已存在但没有被回答命中”的问题，日常运行建议保持关闭
+
 ### 聊天模型
 
 - `OPENAI_BASE_URL`
@@ -779,6 +785,31 @@ STATE_DIR/
 ### 3. 为什么回答会带很多来源？
 
 因为 `rag-api` 会把命中的来源路径附加到最终回答里，方便回溯原文。
+
+### 4. 文件明明在知识库里，为什么没有命中？
+
+常见原因：
+
+- 文件还没完成索引，或者远端运行实例挂载的知识库目录不是你以为的那个路径
+- 纯向量检索没有把目标文件召回到 top-k，尤其是“问题基本等于文件名”这类场景
+- 提问里带了 Markdown 噪音，比如 `**pve安装win10**`、反引号、标题符号，影响了 query embedding
+
+当前版本已做两层优化：
+
+- 查询归一化：会先清理常见 Markdown 符号，再执行检索
+- 文件名命中增强：如果 query 与 `file_name` / `source_path` 明显匹配，会额外提升该文档 chunk 的召回优先级
+
+排查建议：
+
+1. 先确认目标文件是否真的已经完成索引
+2. 必要时临时开启 `DEBUG=true`
+3. 查看 `rag-api` 日志中的 `vector_matches`、`filename_matches`、`selected_matches`
+4. 判断是“未入库”还是“已入库但向量召回不足”
+
+说明：
+
+- 默认 `DEBUG=false`，不会打印详细检索日志
+- 只有在排障时才建议临时开启，避免日志过长
 
 ## 各格式处理限制
 
