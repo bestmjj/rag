@@ -61,6 +61,7 @@ services:
       MIN_RETRIEVAL_SCORE: ${MIN_RETRIEVAL_SCORE:-0.35}
       MAX_CONTEXT_CHARS: ${MAX_CONTEXT_CHARS:-1200}
       MAX_OUTPUT_TOKENS: ${MAX_OUTPUT_TOKENS:-384}
+      DEBUG: ${DEBUG:-false}
 
       # Vector store.
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}

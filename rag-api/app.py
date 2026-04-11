@@ -1,6 +1,7 @@
 import hashlib
 import json
 import csv
+import logging
 import os
 import re
 import subprocess
@@ -35,6 +36,13 @@ except Exception:
 def env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     return int(value) if value else default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 KB_ROOT = Path(os.getenv("KB_ROOT", "/kb")).resolve()
@@ -73,8 +81,13 @@ EXCEL_INCLUDE_EMPTY_ROWS = os.getenv("EXCEL_INCLUDE_EMPTY_ROWS", "false").lower(
 STATE_DIR = Path(os.getenv("STATE_DIR", "/var/lib/rag-api")).resolve()
 MANIFEST_PATH = STATE_DIR / "index_manifest.json"
 JOBS_DIR = STATE_DIR / "jobs"
+DEBUG = env_bool("DEBUG", False)
 
 app = FastAPI(title="lightweight-rag-api", version="0.1.0")
+logger = logging.getLogger("rag-api")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger.setLevel(logging.INFO)
 
 
 @dataclass
@@ -296,6 +309,60 @@ class VectorStore:
                 }
             )
         return matches
+
+    def search_filename_matches(self, query: str, limit: int) -> list[dict[str, Any]]:
+        query_key = normalize_lookup_key(query)
+        if not query_key:
+            return []
+
+        matches = []
+        seen = set()
+        next_offset = None
+        while len(matches) < limit:
+            points, next_offset = self.client.scroll(
+                collection_name=QDRANT_COLLECTION,
+                limit=256,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                break
+
+            for point in points:
+                payload = point.payload or {}
+                source_ref = payload.get("source_ref", payload.get("source_path", ""))
+                chunk_index = payload.get("chunk_index", 0)
+                if not source_ref:
+                    continue
+
+                score = filename_match_score(query_key, payload)
+                if score <= 0:
+                    continue
+
+                key = (source_ref, chunk_index)
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append(
+                    {
+                        "score": score,
+                        "text": payload.get("text", ""),
+                        "source_path": payload.get("source_path", ""),
+                        "source_ref": source_ref,
+                        "file_name": payload.get("file_name", ""),
+                        "sheet_name": payload.get("sheet_name", ""),
+                        "chunk_index": chunk_index,
+                    }
+                )
+                if len(matches) >= limit:
+                    break
+
+            if next_offset is None:
+                break
+
+        matches.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return matches[:limit]
 
 
 class FileIndexer:
@@ -701,6 +768,50 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
+
+
+def normalize_query(text: str) -> str:
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[*_`#>~\[\](){}!]+", " ", text)
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def normalize_lookup_key(text: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", text.lower())
+
+
+def filename_match_score(query_key: str, payload: dict[str, Any]) -> float:
+    file_name = str(payload.get("file_name", ""))
+    source_path = str(payload.get("source_path", ""))
+    source_ref = str(payload.get("source_ref", source_path))
+
+    file_key = normalize_lookup_key(file_name)
+    path_key = normalize_lookup_key(source_path)
+    ref_key = normalize_lookup_key(source_ref)
+
+    if not query_key:
+        return 0.0
+    if query_key == file_key:
+        return 1.3
+    if file_key and query_key in file_key:
+        return 1.2
+    if query_key == path_key or query_key == ref_key:
+        return 1.15
+    if query_key in path_key or query_key in ref_key:
+        return 1.05
+    return 0.0
+
+
+def merge_matches(vector_matches: list[dict[str, Any]], filename_matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for match in [*vector_matches, *filename_matches]:
+        key = (match.get("source_ref") or match.get("source_path"), match.get("chunk_index"))
+        existing = merged.get(key)
+        if existing is None or match.get("score", 0.0) > existing.get("score", 0.0):
+            merged[key] = match
+    return sorted(merged.values(), key=lambda item: item.get("score", 0.0), reverse=True)
 
 
 def read_supported_file(path: Path) -> str:
@@ -1165,7 +1276,22 @@ def chat_completions(request: ChatCompletionRequest) -> Any:
     if not latest_user.strip():
         raise HTTPException(status_code=400, detail="missing user message")
 
-    matches = select_matches(get_store().search(latest_user, RETRIEVAL_LIMIT))
+    normalized_query = normalize_query(latest_user)
+    search_query = normalized_query or latest_user
+    vector_matches = get_store().search(search_query, RETRIEVAL_LIMIT)
+    filename_matches = get_store().search_filename_matches(search_query, RETRIEVAL_LIMIT)
+    raw_matches = merge_matches(vector_matches, filename_matches)
+    matches = select_matches(raw_matches)
+    if DEBUG:
+        logger.info(
+            "retrieval matches query=%s normalized_query=%s vector_matches=%s filename_matches=%s raw_matches=%s selected_matches=%s",
+            latest_user,
+            search_query,
+            json.dumps(vector_matches, ensure_ascii=False),
+            json.dumps(filename_matches, ensure_ascii=False),
+            json.dumps(raw_matches, ensure_ascii=False),
+            json.dumps(matches, ensure_ascii=False),
+        )
     context = build_context(matches)
 
     system_prompt = (
