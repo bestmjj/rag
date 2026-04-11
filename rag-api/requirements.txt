@@ -1,0 +1,12 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.1
+qdrant-client==1.14.2
+openai==1.75.0
+sentence-transformers==4.1.0
+PyMuPDF==1.26.0
+pypdf==5.4.0
+python-docx==1.1.2
+openpyxl==3.1.5
+xlrd==2.0.1
+markdown==3.8
+python-multipart==0.0.20

@@ -1,0 +1,82 @@
+services:
+  open-webui:
+    # OpenWebUI only acts as the user-facing chat UI.
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:main}
+    container_name: ${OPEN_WEBUI_CONTAINER_NAME:-open-webui}
+    restart: ${RESTART_POLICY:-unless-stopped}
+    ports:
+      # Host bind ip : host port : container port
+      - "${OPEN_WEBUI_BIND_HOST:-172.17.0.1}:${OPEN_WEBUI_PORT:-3001}:8080"
+    environment:
+      WEBUI_AUTH: ${WEBUI_AUTH:-False}
+    volumes:
+      # OpenWebUI local state, chats, settings
+      - ${OPEN_WEBUI_DATA_PATH:-./data/openwebui}:/app/backend/data
+    depends_on:
+      - rag-api
+
+  qdrant:
+    # Lightweight vector database.
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:latest}
+    container_name: ${QDRANT_CONTAINER_NAME:-qdrant}
+    restart: ${RESTART_POLICY:-unless-stopped}
+    # ports:
+    #   - "6333:6333"
+    volumes:
+      # Qdrant persistent storage
+      - ${QDRANT_DATA_PATH:-./data/qdrant}:/qdrant/storage
+
+  rag-api:
+    # Thin RAG service: reads local files, indexes them, and proxies chat requests.
+    build:
+      context: ${RAG_API_BUILD_CONTEXT:-./rag-api}
+    container_name: ${RAG_API_CONTAINER_NAME:-rag-api}
+    restart: ${RESTART_POLICY:-unless-stopped}
+    # ports:
+    #   - "8000:8000"
+    environment:
+      # Mounted knowledge base path inside the container.
+      KB_ROOT: ${KB_ROOT:-/kb}
+
+      # Supported file types and path filters.
+      KB_EXTENSIONS: ${KB_EXTENSIONS:-.txt,.text,.md,.markdown,.rst,.log,.ini,.cfg,.conf,.yaml,.yml,.json,.xml,.html,.htm,.css,.js,.ts,.tsx,.jsx,.py,.go,.java,.c,.cc,.cpp,.h,.hpp,.rs,.sh,.sql,.csv,.tsv,.pdf,.doc,.docx,.xls,.xlsx}
+      KB_EXCLUDE_PATTERNS: ${KB_EXCLUDE_PATTERNS:-/recycle/,/cache/,/thumb/}
+
+      # Indexing throughput: larger values are faster but use more RAM/CPU.
+      INDEX_BATCH_SIZE: ${INDEX_BATCH_SIZE:-32}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-128}
+      EXCEL_MAX_ROWS_PER_SHEET: ${EXCEL_MAX_ROWS_PER_SHEET:-5000}
+
+      # Chunking: smaller chunks index faster and reduce prompt size.
+      CHUNK_SIZE: ${CHUNK_SIZE:-500}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-80}
+
+      # Retrieval: keep these small for lower latency.
+      RETRIEVAL_LIMIT: ${RETRIEVAL_LIMIT:-2}
+      MIN_RETRIEVAL_SCORE: ${MIN_RETRIEVAL_SCORE:-0.35}
+      MAX_CONTEXT_CHARS: ${MAX_CONTEXT_CHARS:-1200}
+      MAX_OUTPUT_TOKENS: ${MAX_OUTPUT_TOKENS:-384}
+
+      # Vector store.
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-kodbox_kb}
+
+      # Downstream chat model.
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      CHAT_MODEL: ${CHAT_MODEL}
+
+      # Embeddings: use `local` for sentence-transformers, `openai` for remote embeddings.
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_MODEL_REMOTE: ${EMBEDDING_MODEL_REMOTE:-text-embedding-3-small}
+
+      # PDF extractor: `pymupdf` is usually much faster than `pypdf`.
+      PDF_EXTRACTOR: ${PDF_EXTRACTOR:-pymupdf}
+    volumes:
+      # Host Kodbox storage mounted read-only into the container.
+      - ${KB_HOST_PATH:-/data/kodbox/files}:${KB_ROOT:-/kb}:ro
+    depends_on:
+      - qdrant
