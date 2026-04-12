@@ -583,6 +583,8 @@ chat_service: ChatService | None = None
 index_jobs: dict[str, IndexJobStatus] = {}
 index_jobs_lock = threading.Lock()
 index_run_lock = threading.Lock()
+index_job_threads: dict[str, threading.Thread] = {}
+index_job_threads_lock = threading.Lock()
 
 
 def get_embedder() -> EmbeddingService:
@@ -650,6 +652,43 @@ def save_job_status(job: IndexJobStatus) -> None:
     )
 
 
+def get_job_thread(job_id: str) -> threading.Thread | None:
+    with index_job_threads_lock:
+        thread = index_job_threads.get(job_id)
+        if thread is not None and not thread.is_alive():
+            index_job_threads.pop(job_id, None)
+            return None
+        return thread
+
+
+def persist_job(job: IndexJobStatus) -> IndexJobStatus:
+    with index_jobs_lock:
+        index_jobs[job.job_id] = job
+        save_job_status(job)
+    return job
+
+
+def reconcile_job_status(job: IndexJobStatus) -> IndexJobStatus:
+    if job.status != "running":
+        return job
+    if get_job_thread(job.job_id) is not None:
+        return job
+
+    progress = dict(job.progress or {})
+    progress["phase"] = "failed"
+    return persist_job(
+        IndexJobStatus(
+            job_id=job.job_id,
+            status="failed",
+            started_at=job.started_at,
+            finished_at=time.time(),
+            error="index worker is not running; the previous process likely exited before the job finished",
+            progress=progress,
+            result=job.result,
+        )
+    )
+
+
 def load_job_status(job_id: str) -> IndexJobStatus | None:
     path = job_status_path(job_id)
     if not path.exists():
@@ -703,7 +742,8 @@ def list_index_jobs() -> list[IndexJobStatus]:
         jobs = {job.job_id: job for job in index_jobs.values()}
     for job in load_job_statuses():
         jobs[job.job_id] = job
-    return sorted(jobs.values(), key=lambda job: job.started_at or 0.0, reverse=True)
+    reconciled = [reconcile_job_status(job) for job in jobs.values()]
+    return sorted(reconciled, key=lambda job: job.started_at or 0.0, reverse=True)
 
 
 def get_active_index_job() -> IndexJobStatus | None:
@@ -717,22 +757,31 @@ def run_index_job(job_id: str) -> None:
     with index_run_lock:
         with index_jobs_lock:
             job = index_jobs[job_id]
-            job.status = "running"
-            job.started_at = time.time()
+            started_at = time.time()
+            job = job.model_copy(
+                update={
+                    "status": "running",
+                    "started_at": started_at,
+                    "finished_at": None,
+                    "error": None,
+                    "progress": {"phase": "initializing"},
+                    "result": None,
+                }
+            )
             index_jobs[job_id] = job
             save_job_status(job)
 
         def progress_callback(progress: dict[str, Any]) -> None:
             with index_jobs_lock:
                 current = index_jobs[job_id]
-                current.progress = progress
+                current = current.model_copy(update={"progress": progress})
                 index_jobs[job_id] = current
                 save_job_status(current)
 
         try:
             result = get_indexer().index(progress_callback=progress_callback)
-            with index_jobs_lock:
-                index_jobs[job_id] = IndexJobStatus(
+            persist_job(
+                IndexJobStatus(
                     job_id=job_id,
                     status="completed",
                     started_at=job.started_at,
@@ -748,18 +797,26 @@ def run_index_job(job_id: str) -> None:
                     },
                     result=result,
                 )
-                save_job_status(index_jobs[job_id])
+            )
         except Exception as exc:
+            progress = None
             with index_jobs_lock:
-                index_jobs[job_id] = IndexJobStatus(
+                current = index_jobs.get(job_id)
+                if current is not None:
+                    progress = current.progress
+            persist_job(
+                IndexJobStatus(
                     job_id=job_id,
                     status="failed",
                     started_at=job.started_at,
                     finished_at=time.time(),
                     error=str(exc),
-                    progress=getattr(index_jobs.get(job_id), "progress", None),
+                    progress=progress,
                 )
-                save_job_status(index_jobs[job_id])
+            )
+        finally:
+            with index_job_threads_lock:
+                index_job_threads.pop(job_id, None)
 
 
 def normalize_text(text: str) -> str:
@@ -1236,6 +1293,8 @@ def run_index_async() -> IndexJobStatus:
         save_job_status(job)
 
     thread = threading.Thread(target=run_index_job, args=(job_id,), daemon=True)
+    with index_job_threads_lock:
+        index_job_threads[job_id] = thread
     thread.start()
     return job
 
@@ -1253,7 +1312,7 @@ def get_index_job(job_id: str) -> IndexJobStatus:
         job = load_job_status(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="index job not found")
-    return job
+    return reconcile_job_status(job)
 
 
 @app.get("/v1/models")
