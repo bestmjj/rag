@@ -42,6 +42,8 @@ services:
       # Supported file types and path filters.
       KB_EXTENSIONS: ${KB_EXTENSIONS:-.txt,.text,.md,.markdown,.rst,.log,.ini,.cfg,.conf,.yaml,.yml,.json,.xml,.html,.htm,.css,.js,.ts,.tsx,.jsx,.py,.go,.java,.c,.cc,.cpp,.h,.hpp,.rs,.sh,.sql,.csv,.tsv,.pdf,.doc,.docx,.xls,.xlsx}
       KB_EXCLUDE_PATTERNS: ${KB_EXCLUDE_PATTERNS:-/recycle/,/cache/,/thumb/}
+      DIRECTORY_ALIAS_SCAN_ROOTS: ${DIRECTORY_ALIAS_SCAN_ROOTS:-工作}
+      DIRECTORY_ALIAS_MAP: ${DIRECTORY_ALIAS_MAP:-}
 
       # Indexing throughput: larger values are faster but use more RAM/CPU.
       INDEX_BATCH_SIZE: ${INDEX_BATCH_SIZE:-32}

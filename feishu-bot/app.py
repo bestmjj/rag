@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -18,7 +19,8 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-FEISHU_BASE_URL = os.getenv("FEISHU_BASE_URL", "https://open.feishu.cn")
+DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn"
+FEISHU_BASE_URL = os.getenv("FEISHU_BASE_URL", DEFAULT_FEISHU_BASE_URL)
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 FEISHU_VERIFICATION_TOKEN = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
@@ -105,13 +107,24 @@ async def get_tenant_access_token() -> str:
     if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
         raise RuntimeError("FEISHU_APP_ID and FEISHU_APP_SECRET are required")
 
-    async with httpx.AsyncClient(timeout=FEISHU_HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.post(
-            f"{FEISHU_BASE_URL}/open-apis/auth/v3/tenant_access_token/internal",
-            json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
-        )
-        response.raise_for_status()
-        payload = response.json()
+    last_error = None
+    payload = None
+    for base_url in candidate_feishu_base_urls():
+        try:
+            async with httpx.AsyncClient(timeout=FEISHU_HTTP_TIMEOUT_SECONDS) as client:
+                response = await client.post(
+                    build_feishu_api_url(base_url, "/open-apis/auth/v3/tenant_access_token/internal"),
+                    json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                break
+        except httpx.ConnectError as exc:
+            last_error = exc
+            logger.warning("failed to connect to Feishu auth endpoint host=%s", base_url_host(base_url))
+
+    if payload is None:
+        raise RuntimeError("failed to connect to Feishu auth endpoint") from last_error
 
     if payload.get("code") != 0:
         raise RuntimeError(f"failed to get tenant access token: {payload}")
@@ -134,6 +147,32 @@ def parse_feishu_text_content(content: str) -> str:
     if isinstance(payload, dict):
         return str(payload.get("text", "")).strip()
     return content.strip()
+
+
+def normalize_base_url(url: str, default: str) -> str:
+    value = (url or "").strip().strip('"').strip("'")
+    if not value:
+        return default
+    if "://" not in value:
+        value = f"https://{value}"
+    return value.rstrip("/")
+
+
+def candidate_feishu_base_urls() -> list[str]:
+    bases = []
+    configured = normalize_base_url(FEISHU_BASE_URL, DEFAULT_FEISHU_BASE_URL)
+    for value in [configured, DEFAULT_FEISHU_BASE_URL]:
+        if value not in bases:
+            bases.append(value)
+    return bases
+
+
+def build_feishu_api_url(base_url: str, path: str) -> str:
+    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def base_url_host(url: str) -> str:
+    return urlsplit(url).netloc
 
 
 def build_text_message(text: str) -> str:
@@ -177,14 +216,29 @@ async def send_feishu_message(chat_id: str, text: str) -> None:
         "content": build_text_message(text),
     }
     headers = {"Authorization": f"Bearer {token}"}
-    async with httpx.AsyncClient(timeout=FEISHU_HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.post(
-            f"{FEISHU_BASE_URL}/open-apis/im/v1/messages?receive_id_type=chat_id",
-            json=payload,
-            headers=headers,
-        )
-        response.raise_for_status()
-        data = response.json()
+    last_error = None
+    data = None
+    for base_url in candidate_feishu_base_urls():
+        try:
+            async with httpx.AsyncClient(timeout=FEISHU_HTTP_TIMEOUT_SECONDS) as client:
+                response = await client.post(
+                    build_feishu_api_url(base_url, "/open-apis/im/v1/messages?receive_id_type=chat_id"),
+                    json=payload,
+                    headers=headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+                break
+        except httpx.ConnectError as exc:
+            last_error = exc
+            logger.warning(
+                "failed to connect to Feishu message endpoint host=%s chat_id=%s",
+                base_url_host(base_url),
+                chat_id,
+            )
+
+    if data is None:
+        raise RuntimeError("failed to connect to Feishu message endpoint") from last_error
     if data.get("code") != 0:
         raise RuntimeError(f"failed to send Feishu message: {data}")
 

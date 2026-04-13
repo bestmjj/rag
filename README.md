@@ -84,6 +84,7 @@ curl -X POST http://127.0.0.1:8000/index/async
    - 重新切块
    - 生成 embedding
    - 批量写入 Qdrant
+   - 同时写入 `dir_path`、`path_ancestors` 等目录元数据，供后续按目录过滤检索
 7. 如果某个文件已从磁盘删除：
    - 自动从 Qdrant 删除对应 chunk
 
@@ -98,12 +99,13 @@ POST /v1/chat/completions
 流程：
 
 1. `rag-api` 取最后一条用户问题
-2. 将问题转成 query embedding
-3. 到 Qdrant 检索相似 chunk
-4. 根据分数过滤结果
-5. 将有限数量的 chunk 拼成上下文
-6. 调用下游 chat 模型生成答案
-7. 将来源路径附加到回答后返回给 OpenWebUI
+2. 如果命中了目录别名，先把它解析成目录范围过滤条件
+3. 将剩余问题转成 query embedding
+4. 到 Qdrant 检索相似 chunk，并结合文件名命中增强
+5. 根据分数过滤结果
+6. 将有限数量的 chunk 拼成上下文
+7. 调用下游 chat 模型生成答案
+8. 将来源路径附加到回答后返回给 OpenWebUI
 
 ## 目录结构
 
@@ -229,6 +231,7 @@ https://bot.example.com/feishu/events
 - 会忽略机器人自身发出的消息，避免自循环
 - 会调用 `rag-api` 的 `POST /v1/chat/completions`
 - 回答过长时会自动截断
+- 如果 `FEISHU_BASE_URL` 配错域名或带了异常引号，发送消息时会自动回退到 `https://open.feishu.cn`
 
 如果你还希望在群聊里使用，可以把：
 
@@ -346,6 +349,21 @@ FEISHU_ALLOWED_CHAT_TYPES=p2p,group
   - 示例：`/recycle/,/cache/,/thumb/`
   - 对大目录非常重要，能显著减少扫描和索引开销
 
+- `DIRECTORY_ALIAS_MAP`
+  - 手工覆盖的目录别名到真实路径的 JSON 映射表
+  - 会覆盖自动扫描到的同名目录，并允许补充简称或历史别名
+  - 支持简单写法：`{"完美视界":"工作/完美视界"}`
+  - 也支持扩展写法：`{"完美视界":{"path":"工作/完美视界","aliases":["完美"],"project_id":"proj_vk"}}`
+  - 相对路径会基于 `KB_ROOT` 解析，绝对路径会直接使用
+  - 目录改名时只需要更新这里的映射，再重跑索引以刷新返回路径和目录元数据
+
+- `DIRECTORY_ALIAS_SCAN_ROOTS`
+  - 自动扫描一级子目录并生成默认别名的根目录列表，多个值用逗号分隔
+  - 默认：`工作`
+  - 例如：`工作,客户,归档项目`
+  - 系统会把每个扫描根目录下的一级子目录名直接当成可检索别名
+  - 当自动发现结果与 `DIRECTORY_ALIAS_MAP` 冲突时，以 `DIRECTORY_ALIAS_MAP` 为准
+
 ### Indexing and chunking
 
 - `INDEX_BATCH_SIZE`
@@ -383,6 +401,7 @@ FEISHU_ALLOWED_CHAT_TYPES=p2p,group
   - 每次检索返回的 chunk 数上限
   - 越大上下文越全，但模型越慢
   - 日常问答建议：`2-4`
+  - 当问题命中目录别名时，`RETRIEVAL_LIMIT` 只会作用在该目录范围内的结果
 
 - `MIN_RETRIEVAL_SCORE`
   - 最低相似度阈值
@@ -402,7 +421,7 @@ FEISHU_ALLOWED_CHAT_TYPES=p2p,group
 - `DEBUG`
   - 是否输出详细检索调试日志
   - 默认：`false`
-  - 设为 `true` 后，会打印 `normalized_query`、`vector_matches`、`filename_matches`、`raw_matches`、`selected_matches`
+  - 设为 `true` 后，会打印 `normalized_query`、`scope`、`vector_matches`、`filename_matches`、`raw_matches`、`selected_matches`
   - 适合排查“文件已存在但没有被回答命中”的问题，日常运行建议保持关闭
 
 ### 聊天模型
@@ -931,6 +950,33 @@ curl http://127.0.0.1:8088/health
 
 来减轻延迟。
 
+### 2.1 如何只查某个目录，比如“工作/维瞰视界”？
+
+默认会扫描 `DIRECTORY_ALIAS_SCAN_ROOTS` 里的一级目录并自动生成别名。默认配置下，只要你的项目目录在 `工作/` 下，例如 `工作/完美视界`、`工作/上海卫士`，就可以直接按目录名提问。
+
+如果你还需要简称、旧名称兼容或非标准路径，再在 `.env` 里补充手工映射，例如：
+
+```env
+DIRECTORY_ALIAS_SCAN_ROOTS=工作
+DIRECTORY_ALIAS_MAP={"维瞰视界":{"path":"工作/维瞰视界","aliases":["维瞰"]},"天空卫士":{"path":"工作/天空卫士"}}
+```
+
+然后重启 `rag-api` 并重新执行一次索引。之后用户可以直接提问：
+
+- `维瞰视界中的开票信息`
+- `查天空卫士的报销模板`
+
+命中别名后，检索会自动限制在该目录及其子目录内，避免把别的项目内容混进结果。
+
+### 2.2 目录改名后怎么办？
+
+- 如果新目录仍位于 `DIRECTORY_ALIAS_SCAN_ROOTS` 下，重启后会自动发现新的目录名
+- 更新 `DIRECTORY_ALIAS_MAP` 中对应项目的 `path`
+- 重启 `rag-api`
+- 重新跑一次索引，让 `source_path`、`dir_path`、`path_ancestors` 元数据同步到新路径
+
+如果只是新增别名、不改实际路径，也建议重启服务让新配置生效。
+
 ### 3. 为什么回答会带很多来源？
 
 因为 `rag-api` 会把命中的来源路径附加到最终回答里，方便回溯原文。
@@ -947,6 +993,9 @@ curl http://127.0.0.1:8088/health
 
 - 查询归一化：会先清理常见 Markdown 符号，再执行检索
 - 文件名命中增强：如果 query 与 `file_name` / `source_path` 明显匹配，会额外提升该文档 chunk 的召回优先级
+- Excel Sheet 命中增强：会额外参考 `sheet_name`，并对 `问题`、`处理`、`总览` 等词做 sheet 级重排提升
+
+如果是 `维瞰视界 资阳服务问题` 这类“目录名 + 表格 sheet 主题”的问法，当前版本还会清理目录名后残留的连接词，避免 `中资阳服务的问题` 这种脏 query 影响召回。
 
 排查建议：
 
@@ -980,6 +1029,7 @@ curl http://127.0.0.1:8088/health
 - 当前异步索引基于进程内线程，容器重启后运行中的任务不会恢复，但已落盘的任务状态文件仍可查看
 - 还没有分布式任务队列
 - 还没有多知识库、多租户隔离能力
+- 目录别名目前来自“启动时自动扫描 + 环境变量覆盖”，修改后需要重启 `rag-api` 才会生效
 
 ## 后续可优化方向
 

@@ -82,6 +82,9 @@ STATE_DIR = Path(os.getenv("STATE_DIR", "/var/lib/rag-api")).resolve()
 MANIFEST_PATH = STATE_DIR / "index_manifest.json"
 JOBS_DIR = STATE_DIR / "jobs"
 DEBUG = env_bool("DEBUG", False)
+DIRECTORY_ALIAS_SCAN_ROOTS = [
+    value.strip() for value in os.getenv("DIRECTORY_ALIAS_SCAN_ROOTS", "工作").split(",") if value.strip()
+]
 
 app = FastAPI(title="lightweight-rag-api", version="0.1.0")
 logger = logging.getLogger("rag-api")
@@ -285,12 +288,14 @@ class VectorStore:
                 break
         return records
 
-    def search(self, query: str, limit: int) -> list[dict[str, Any]]:
+    def search(self, query: str, limit: int, path_ancestor: str | None = None) -> list[dict[str, Any]]:
         vector = self.embedder.embed([query])[0]
+        query_filter = build_path_ancestor_filter(path_ancestor)
         results = self.client.query_points(
             collection_name=QDRANT_COLLECTION,
             query=vector,
             limit=limit,
+            query_filter=query_filter,
             with_payload=True,
             with_vectors=False,
         )
@@ -310,7 +315,12 @@ class VectorStore:
             )
         return matches
 
-    def search_filename_matches(self, query: str, limit: int) -> list[dict[str, Any]]:
+    def search_filename_matches(
+        self,
+        query: str,
+        limit: int,
+        path_ancestor: str | None = None,
+    ) -> list[dict[str, Any]]:
         query_key = normalize_lookup_key(query)
         if not query_key:
             return []
@@ -331,6 +341,8 @@ class VectorStore:
 
             for point in points:
                 payload = point.payload or {}
+                if path_ancestor and path_ancestor not in payload.get("path_ancestors", []):
+                    continue
                 source_ref = payload.get("source_ref", payload.get("source_path", ""))
                 chunk_index = payload.get("chunk_index", 0)
                 if not source_ref:
@@ -839,17 +851,154 @@ def normalize_lookup_key(text: str) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]+", "", text.lower())
 
 
+def build_path_ancestor_filter(path_ancestor: str | None) -> qmodels.Filter | None:
+    if not path_ancestor:
+        return None
+    return qmodels.Filter(
+        must=[qmodels.FieldCondition(key="path_ancestors", match=qmodels.MatchAny(any=[path_ancestor]))]
+    )
+
+
+def path_ancestors(path: Path) -> list[str]:
+    resolved = path.resolve()
+    ancestors = [str(parent) for parent in reversed(resolved.parents)]
+    ancestors.append(str(resolved.parent))
+    return list(dict.fromkeys(ancestors))
+
+
+def strip_scope_alias(query: str, alias: str) -> str:
+    pattern = re.compile(re.escape(alias), re.IGNORECASE)
+    stripped = pattern.sub(" ", query)
+    stripped = re.sub(r"^(?:中|里|内|的)+", " ", stripped)
+    stripped = re.sub(r"(?:中的|里[的]?|目录|项目|资料|信息)", " ", stripped)
+    stripped = re.sub(r"^(?:查(?:一下)?|查询|关于|有关|帮我查(?:一下)?|看下?)", " ", stripped)
+    stripped = re.sub(r"\s+", " ", stripped)
+    return stripped.strip()
+
+
+def resolve_directory_scope(query: str) -> dict[str, Any] | None:
+    normalized_query = normalize_lookup_key(query)
+    if not normalized_query:
+        return None
+    for entry in DIRECTORY_ALIAS_ENTRIES:
+        if entry["alias_key"] not in normalized_query:
+            continue
+        return {
+            "alias": entry["alias"],
+            "path": entry["path"],
+            "project_id": entry["project_id"],
+            "scoped_query": strip_scope_alias(query, entry["alias"]),
+        }
+    return None
+
+
+def load_directory_aliases() -> list[dict[str, Any]]:
+    entries = []
+    seen_keys = set()
+
+    def add_entry(alias: str, path: str, project_id: str = "") -> None:
+        lookup_key = normalize_lookup_key(alias)
+        if not lookup_key or lookup_key in seen_keys or not path:
+            return
+        resolved_path = str((KB_ROOT / path.lstrip("/")).resolve()) if not os.path.isabs(path) else str(Path(path).resolve())
+        seen_keys.add(lookup_key)
+        entries.append(
+            {
+                "alias": alias,
+                "alias_key": lookup_key,
+                "path": resolved_path,
+                "project_id": project_id or lookup_key,
+            }
+        )
+
+    for root_value in DIRECTORY_ALIAS_SCAN_ROOTS:
+        root_path = (KB_ROOT / root_value.lstrip("/")).resolve() if not os.path.isabs(root_value) else Path(root_value).resolve()
+        if not root_path.exists() or not root_path.is_dir():
+            continue
+        for child in sorted(root_path.iterdir()):
+            if not child.is_dir():
+                continue
+            add_entry(child.name, str(child), project_id=normalize_lookup_key(child.name))
+
+    raw = os.getenv("DIRECTORY_ALIAS_MAP", "").strip()
+    if not raw:
+        entries.sort(key=lambda item: len(item["alias_key"]), reverse=True)
+        return entries
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("failed to parse DIRECTORY_ALIAS_MAP: %s", exc)
+        entries.sort(key=lambda item: len(item["alias_key"]), reverse=True)
+        return entries
+
+    if not isinstance(data, dict):
+        logger.warning("DIRECTORY_ALIAS_MAP must be a JSON object")
+        entries.sort(key=lambda item: len(item["alias_key"]), reverse=True)
+        return entries
+
+    manual_entries = []
+    manual_seen_keys = set()
+    for alias, value in data.items():
+        aliases = [str(alias).strip()]
+        path = ""
+        project_id = ""
+        if isinstance(value, str):
+            path = value.strip()
+        elif isinstance(value, dict):
+            path = str(value.get("path", "")).strip()
+            project_id = str(value.get("project_id", "")).strip()
+            extra_aliases = value.get("aliases", [])
+            if isinstance(extra_aliases, list):
+                aliases.extend(str(item).strip() for item in extra_aliases if str(item).strip())
+        if not path:
+            continue
+
+        for item in aliases:
+            lookup_key = normalize_lookup_key(item)
+            if not lookup_key or lookup_key in manual_seen_keys:
+                continue
+            manual_seen_keys.add(lookup_key)
+            manual_entries.append(
+                {
+                    "alias": item,
+                    "alias_key": lookup_key,
+                    "path": str((KB_ROOT / path.lstrip("/")).resolve()) if not os.path.isabs(path) else str(Path(path).resolve()),
+                    "project_id": project_id or lookup_key,
+                }
+            )
+
+    if manual_entries:
+        manual_keys = {item["alias_key"] for item in manual_entries}
+        entries = [item for item in entries if item["alias_key"] not in manual_keys]
+        entries = [*manual_entries, *entries]
+
+    entries.sort(key=lambda item: len(item["alias_key"]), reverse=True)
+    return entries
+
+
+DIRECTORY_ALIAS_ENTRIES = load_directory_aliases()
+
+
 def filename_match_score(query_key: str, payload: dict[str, Any]) -> float:
     file_name = str(payload.get("file_name", ""))
     source_path = str(payload.get("source_path", ""))
     source_ref = str(payload.get("source_ref", source_path))
+    sheet_name = str(payload.get("sheet_name", ""))
 
     file_key = normalize_lookup_key(file_name)
     path_key = normalize_lookup_key(source_path)
     ref_key = normalize_lookup_key(source_ref)
+    sheet_key = normalize_lookup_key(sheet_name)
 
     if not query_key:
         return 0.0
+    if sheet_key and query_key == sheet_key:
+        return 1.45
+    if sheet_key and query_key in sheet_key:
+        return 1.35
+    if sheet_key and sheet_key in query_key:
+        return 1.25
     if query_key == file_key:
         return 1.3
     if file_key and query_key in file_key:
@@ -859,6 +1008,64 @@ def filename_match_score(query_key: str, payload: dict[str, Any]) -> float:
     if query_key in path_key or query_key in ref_key:
         return 1.05
     return 0.0
+
+
+def token_overlap_score(query: str, payload: dict[str, Any]) -> float:
+    query_terms = [normalize_lookup_key(part) for part in re.split(r"\s+", query) if part.strip()]
+    query_terms = [term for term in query_terms if term]
+    if not query_terms:
+        return 0.0
+
+    fields = [
+        normalize_lookup_key(str(payload.get("file_name", ""))),
+        normalize_lookup_key(str(payload.get("sheet_name", ""))),
+        normalize_lookup_key(str(payload.get("source_ref", payload.get("source_path", "")))),
+    ]
+    score = 0.0
+    for term in query_terms:
+        for field in fields:
+            if not field:
+                continue
+            if term == field:
+                score += 0.2
+                break
+            if len(term) >= 2 and term in field:
+                score += 0.12
+                break
+    return min(score, 0.6)
+
+
+def issue_sheet_boost(query: str, payload: dict[str, Any]) -> float:
+    query_key = normalize_lookup_key(query)
+    if not query_key:
+        return 0.0
+
+    sheet_key = normalize_lookup_key(str(payload.get("sheet_name", "")))
+    if not sheet_key:
+        return 0.0
+
+    boost = 0.0
+    if "问题" in query and "问题" in sheet_key:
+        boost += 0.35
+    if "处理" in query and "处理" in sheet_key:
+        boost += 0.25
+    if "总览" in query and "总览" in sheet_key:
+        boost += 0.25
+    if "情况" in query and "情况" in sheet_key:
+        boost += 0.15
+    return boost
+
+
+def rerank_matches(query: str, matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    reranked = []
+    query_key = normalize_lookup_key(query)
+    for match in matches:
+        score = float(match.get("score", 0.0))
+        score += filename_match_score(query_key, match)
+        score += token_overlap_score(query, match)
+        score += issue_sheet_boost(query, match)
+        reranked.append({**match, "score": score})
+    return sorted(reranked, key=lambda item: item.get("score", 0.0), reverse=True)
 
 
 def merge_matches(vector_matches: list[dict[str, Any]], filename_matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1074,6 +1281,8 @@ def split_text(text: str) -> list[str]:
 def build_chunks(path: Path, text: str, file_hash: str, mtime: float) -> list[Chunk]:
     chunks = []
     rel_name = path.name
+    dir_path = str(path.parent)
+    ancestors = path_ancestors(path)
     if path.suffix.lower() in {".xls", ".xlsx"}:
         for sheet in read_excel_sheet_texts(path):
             sheet_title = sheet["title"]
@@ -1086,6 +1295,8 @@ def build_chunks(path: Path, text: str, file_hash: str, mtime: float) -> list[Ch
                         payload={
                             "source_path": str(path),
                             "source_ref": source_ref,
+                            "dir_path": dir_path,
+                            "path_ancestors": ancestors,
                             "sheet_name": sheet_title,
                             "file_name": rel_name,
                             "chunk_index": index,
@@ -1104,6 +1315,8 @@ def build_chunks(path: Path, text: str, file_hash: str, mtime: float) -> list[Ch
                 payload={
                     "source_path": str(path),
                     "source_ref": str(path),
+                    "dir_path": dir_path,
+                    "path_ancestors": ancestors,
                     "file_name": rel_name,
                     "chunk_index": index,
                     "file_hash": file_hash,
@@ -1336,16 +1549,20 @@ def chat_completions(request: ChatCompletionRequest) -> Any:
         raise HTTPException(status_code=400, detail="missing user message")
 
     normalized_query = normalize_query(latest_user)
-    search_query = normalized_query or latest_user
-    vector_matches = get_store().search(search_query, RETRIEVAL_LIMIT)
-    filename_matches = get_store().search_filename_matches(search_query, RETRIEVAL_LIMIT)
-    raw_matches = merge_matches(vector_matches, filename_matches)
+    scope = resolve_directory_scope(normalized_query or latest_user)
+    scoped_query = (scope or {}).get("scoped_query", "")
+    search_query = normalize_query(scoped_query) or normalized_query or latest_user
+    path_ancestor = (scope or {}).get("path")
+    vector_matches = get_store().search(search_query, RETRIEVAL_LIMIT, path_ancestor=path_ancestor)
+    filename_matches = get_store().search_filename_matches(search_query, RETRIEVAL_LIMIT, path_ancestor=path_ancestor)
+    raw_matches = rerank_matches(search_query, merge_matches(vector_matches, filename_matches))
     matches = select_matches(raw_matches)
     if DEBUG:
         logger.info(
-            "retrieval matches query=%s normalized_query=%s vector_matches=%s filename_matches=%s raw_matches=%s selected_matches=%s",
+            "retrieval matches query=%s normalized_query=%s scope=%s vector_matches=%s filename_matches=%s raw_matches=%s selected_matches=%s",
             latest_user,
             search_query,
+            json.dumps(scope, ensure_ascii=False),
             json.dumps(vector_matches, ensure_ascii=False),
             json.dumps(filename_matches, ensure_ascii=False),
             json.dumps(raw_matches, ensure_ascii=False),
@@ -1356,6 +1573,7 @@ def chat_completions(request: ChatCompletionRequest) -> Any:
     system_prompt = (
         "You are a retrieval-augmented assistant. Use the provided context first. "
         "If the context is insufficient, say so clearly. Always keep answers concise and include source paths when relevant.\n\n"
+        f"Retrieval scope: {(scope or {}).get('path', 'all indexed files')}\n\n"
         f"Context:\n{context if context else 'No relevant documents were found.'}"
     )
     llm_messages = [{"role": "system", "content": system_prompt}, *user_messages]
