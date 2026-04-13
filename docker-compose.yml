@@ -89,6 +89,31 @@ services:
     depends_on:
       - qdrant
 
+  feishu-bot:
+    # Feishu/Lark bot adapter: receives message events and forwards them to rag-api.
+    build:
+      context: ${FEISHU_BOT_BUILD_CONTEXT:-./feishu-bot}
+    container_name: ${FEISHU_BOT_CONTAINER_NAME:-feishu-bot}
+    restart: ${RESTART_POLICY:-unless-stopped}
+    ports:
+      - "${FEISHU_BOT_BIND_HOST:-127.0.0.1}:${FEISHU_BOT_PORT:-8088}:8080"
+    environment:
+      FEISHU_BASE_URL: ${FEISHU_BASE_URL:-https://open.feishu.cn}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_VERIFICATION_TOKEN: ${FEISHU_VERIFICATION_TOKEN:-}
+      FEISHU_SIGNING_SECRET: ${FEISHU_SIGNING_SECRET:-}
+      FEISHU_RAG_API_BASE: ${FEISHU_RAG_API_BASE:-http://rag-api:8000}
+      FEISHU_RAG_MODEL: ${FEISHU_RAG_MODEL:-rag-model}
+      FEISHU_RAG_API_KEY: ${FEISHU_RAG_API_KEY:-feishu-bot}
+      FEISHU_REPLY_PREFIX: ${FEISHU_REPLY_PREFIX:-}
+      FEISHU_ALLOWED_CHAT_TYPES: ${FEISHU_ALLOWED_CHAT_TYPES:-p2p}
+      FEISHU_MESSAGE_MAX_CHARS: ${FEISHU_MESSAGE_MAX_CHARS:-4000}
+      FEISHU_HTTP_TIMEOUT_SECONDS: ${FEISHU_HTTP_TIMEOUT_SECONDS:-120}
+      DEBUG: ${DEBUG:-false}
+    depends_on:
+      - rag-api
+
   rag-index-scheduler:
     # Lightweight polling scheduler that periodically triggers async indexing.
     image: curlimages/curl:8.12.1

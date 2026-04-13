@@ -6,6 +6,7 @@
 
 - `OpenWebUI` 作为用户入口
 - `rag-api` 作为薄 RAG 服务
+- `feishu-bot` 可选作为飞书消息适配层
 - `Qdrant` 作为向量库
 - `Kodbox` 文件目录通过宿主机挂载给 `rag-api`，不走上传流程
 
@@ -36,6 +37,12 @@
   - 解析文档、切块、生成向量、写入 Qdrant
   - 查询时先检索，再调用下游 chat 模型生成答案
   - 对外暴露 OpenAI-compatible `chat completions` 接口
+
+- `feishu-bot`
+  - 接收飞书事件订阅推送
+  - 将文本消息转发给 `rag-api`
+  - 将 RAG 回答回发到飞书会话
+  - 默认只处理 `p2p` 私聊文本消息
 
 - `qdrant`
   - 存储 chunk 向量和元数据
@@ -105,6 +112,10 @@ POST /v1/chat/completions
 ├── docker-compose.yml
 ├── .env.example
 ├── README.md
+├── feishu-bot/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── app.py
 └── rag-api/
     ├── Dockerfile
     ├── requirements.txt
@@ -176,6 +187,57 @@ http://<your-host>:8000/v1
 
 说明：当前 `rag-api` 不校验上游 API Key，OpenWebUI 中填任意非空字符串即可。
 
+### 5. 在飞书中接入
+
+当前仓库已内置 `feishu-bot` 服务，用于把飞书文本消息转发到 `rag-api`。
+
+先在 `.env` 中补上至少这些参数：
+
+```env
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+FEISHU_VERIFICATION_TOKEN=xxx
+FEISHU_SIGNING_SECRET=xxx
+FEISHU_BOT_BIND_HOST=127.0.0.1
+FEISHU_BOT_PORT=8088
+```
+
+启动后，回调入口为：
+
+```text
+http://<your-host>:8088/feishu/events
+```
+
+生产环境应通过反向代理暴露成公网 HTTPS，例如：
+
+```text
+https://bot.example.com/feishu/events
+```
+
+飞书开放平台建议配置：
+
+- 开启机器人能力
+- 开启事件订阅
+- 订阅事件 `im.message.receive_v1`
+- 将请求地址设置为 `https://<your-domain>/feishu/events`
+- 在权限中开启消息接收与发送相关能力
+
+当前 `feishu-bot` 默认行为：
+
+- 仅处理文本消息
+- 默认仅响应 `p2p` 私聊
+- 会忽略机器人自身发出的消息，避免自循环
+- 会调用 `rag-api` 的 `POST /v1/chat/completions`
+- 回答过长时会自动截断
+
+如果你还希望在群聊里使用，可以把：
+
+```env
+FEISHU_ALLOWED_CHAT_TYPES=p2p,group
+```
+
+再重新启动容器。
+
 ## API
 
 - `GET /health`
@@ -203,6 +265,14 @@ http://<your-host>:8000/v1
 - `POST /v1/chat/completions`
   - OpenAI-compatible 聊天接口
   - 支持普通返回和 `stream=true`
+
+- `feishu-bot: GET /health`
+  - 飞书适配服务健康检查
+
+- `feishu-bot: POST /feishu/events`
+  - 飞书事件订阅入口
+  - 支持 `url_verification`
+  - 处理 `im.message.receive_v1` 文本消息事件
 
 ## `.env` 参数说明
 
@@ -458,6 +528,12 @@ http://<your-host>:8000/v1
 - `RAG_API_CONTAINER_NAME`
   - `rag-api` 容器名
 
+- `FEISHU_BOT_BUILD_CONTEXT`
+  - `feishu-bot` 镜像构建上下文目录
+
+- `FEISHU_BOT_CONTAINER_NAME`
+  - `feishu-bot` 容器名
+
 - `RESTART_POLICY`
   - Docker 重启策略
 
@@ -468,6 +544,61 @@ http://<your-host>:8000/v1
   - 定时触发异步索引的间隔秒数
   - 默认 `600`，即每 10 分钟尝试触发一次
   - 如果上一次索引仍在执行，这一轮会被自动跳过
+
+### Feishu bot
+
+- `FEISHU_BOT_BIND_HOST`
+  - `feishu-bot` 暴露到宿主机的绑定地址
+  - 本地反代时通常保持 `127.0.0.1`
+
+- `FEISHU_BOT_PORT`
+  - `feishu-bot` 宿主机端口
+
+- `FEISHU_BASE_URL`
+  - 飞书开放平台 API 基础地址
+  - 默认 `https://open.feishu.cn`
+
+- `FEISHU_APP_ID`
+  - 飞书应用 App ID
+
+- `FEISHU_APP_SECRET`
+  - 飞书应用 App Secret
+
+- `FEISHU_VERIFICATION_TOKEN`
+  - 飞书事件订阅的 verification token
+  - 如果飞书后台未配置，可留空
+
+- `FEISHU_SIGNING_SECRET`
+  - 飞书事件订阅签名密钥
+  - 配置后，`feishu-bot` 会校验 `X-Lark-Signature`
+
+- `FEISHU_RAG_API_BASE`
+  - `feishu-bot` 调用 RAG 服务的基础地址
+  - 默认容器内走 `http://rag-api:8000`
+
+- `FEISHU_RAG_MODEL`
+  - 调用 `POST /v1/chat/completions` 时使用的模型名
+  - 默认 `rag-model`
+
+- `FEISHU_RAG_API_KEY`
+  - 调用 `rag-api` 时带上的 Bearer Token
+  - 当前 `rag-api` 不校验，可保持默认任意非空字符串
+
+- `FEISHU_REPLY_PREFIX`
+  - 机器人回复前缀
+  - 例如可设为 `[知识库] `
+
+- `FEISHU_ALLOWED_CHAT_TYPES`
+  - 允许响应的会话类型，逗号分隔
+  - 默认 `p2p`
+  - 如需群聊支持可设为 `p2p,group`
+
+- `FEISHU_MESSAGE_MAX_CHARS`
+  - 单条飞书回复最大字符数
+  - 超出会自动截断并附加 `[已截断]`
+
+- `FEISHU_HTTP_TIMEOUT_SECONDS`
+  - `feishu-bot` 调用飞书接口和 `rag-api` 的超时秒数
 
 - `EXCEL_MAX_ROWS_PER_SHEET`
   - 单个 Excel sheet 最大读取行数
@@ -752,6 +883,24 @@ STATE_DIR/
 - 无法检索
 
 ## 常见问题
+
+### 0. 飞书事件订阅验证失败怎么办？
+
+优先检查：
+
+- 回调地址是否为公网 HTTPS
+- 飞书后台配置的 URL 是否指向 `POST /feishu/events`
+- `FEISHU_VERIFICATION_TOKEN` 是否与后台一致
+- `FEISHU_SIGNING_SECRET` 是否与后台一致
+- 反向代理是否保留了原始请求体和 `X-Lark-*` 请求头
+
+本地可先检查：
+
+```bash
+curl http://127.0.0.1:8088/health
+```
+
+如果容器健康但飞书仍验证失败，通常是公网回调链路或签名配置不一致。
 
 ### 1. 为什么索引很慢？
 
