@@ -4,6 +4,7 @@ import csv
 import logging
 import os
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -85,6 +86,18 @@ DEBUG = env_bool("DEBUG", False)
 DIRECTORY_ALIAS_SCAN_ROOTS = [
     value.strip() for value in os.getenv("DIRECTORY_ALIAS_SCAN_ROOTS", "工作").split(",") if value.strip()
 ]
+ENABLE_SHELL_TOOL = env_bool("ENABLE_SHELL_TOOL", False)
+SHELL_TOOL_TIMEOUT_SECONDS = float(os.getenv("SHELL_TOOL_TIMEOUT_SECONDS", "15"))
+SHELL_TOOL_MAX_OUTPUT_CHARS = env_int("SHELL_TOOL_MAX_OUTPUT_CHARS", 12000)
+SHELL_TOOL_WORKDIR = Path(os.getenv("SHELL_TOOL_WORKDIR", str(KB_ROOT))).resolve()
+SHELL_TOOL_BLOCKED_COMMANDS = {
+    value.strip().lower()
+    for value in os.getenv(
+        "SHELL_TOOL_BLOCKED_COMMANDS",
+        "rm,mv,cp,chmod,chown,kill,pkill,shutdown,reboot,dd,mkfs,fdisk,mount,umount",
+    ).split(",")
+    if value.strip()
+}
 
 app = FastAPI(title="lightweight-rag-api", version="0.1.0")
 logger = logging.getLogger("rag-api")
@@ -287,6 +300,31 @@ class VectorStore:
             if next_offset is None:
                 break
         return records
+
+    def list_files_in_scope(self, path_ancestor: str) -> list[str]:
+        files = []
+        seen = set()
+        next_offset = None
+        while True:
+            points, next_offset = self.client.scroll(
+                collection_name=QDRANT_COLLECTION,
+                limit=256,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+                scroll_filter=build_path_ancestor_filter(path_ancestor),
+            )
+            for point in points:
+                payload = point.payload or {}
+                source_path = str(payload.get("source_path", "")).strip()
+                if not source_path or source_path in seen:
+                    continue
+                seen.add(source_path)
+                files.append(source_path)
+            if next_offset is None:
+                break
+        files.sort()
+        return files
 
     def search(self, query: str, limit: int, path_ancestor: str | None = None) -> list[dict[str, Any]]:
         vector = self.embedder.embed([query])[0]
@@ -876,6 +914,48 @@ def strip_scope_alias(query: str, alias: str) -> str:
     return stripped.strip()
 
 
+def is_directory_listing_query(query: str, scope: dict[str, Any] | None) -> bool:
+    if scope is None:
+        return False
+    query_text = query.strip()
+    if not query_text:
+        return False
+    patterns = [
+        r"有哪些文件",
+        r"有什么文件",
+        r"目录.*文件",
+        r"列出.*文件",
+        r"文件列表",
+        r"目录列表",
+        r"看看.*文件",
+        r"有哪些资料",
+        r"有什么资料",
+        r"目录下.*内容",
+    ]
+    return any(re.search(pattern, query_text) for pattern in patterns)
+
+
+def build_directory_listing_answer(scope: dict[str, Any], files: list[str]) -> str:
+    path_ancestor = scope["path"]
+    alias = scope.get("alias") or path_ancestor
+    if not files:
+        return f"`{alias}` 目录下暂未检索到已索引文件。"
+
+    lines = [f"`{alias}` 目录下已索引文件如下：", ""]
+    for file_path in files[:50]:
+        relative = file_path
+        if file_path.startswith(path_ancestor.rstrip("/") + "/"):
+            relative = file_path[len(path_ancestor.rstrip("/")) + 1 :]
+        elif file_path == path_ancestor:
+            relative = Path(file_path).name
+        lines.append(f"- `{relative}`")
+    if len(files) > 50:
+        lines.extend(["", f"共 {len(files)} 个文件，仅显示前 50 个。"])
+    else:
+        lines.extend(["", f"共 {len(files)} 个文件。"])
+    return "\n".join(lines)
+
+
 def resolve_directory_scope(query: str) -> dict[str, Any] | None:
     normalized_query = normalize_lookup_key(query)
     if not normalized_query:
@@ -890,6 +970,93 @@ def resolve_directory_scope(query: str) -> dict[str, Any] | None:
             "scoped_query": strip_scope_alias(query, entry["alias"]),
         }
     return None
+
+
+def detect_shell_command(query: str) -> str | None:
+    text = query.strip()
+    if not text:
+        return None
+
+    patterns = [
+        r"^(?:请)?执行命令[:：]?\s*(.+)$",
+        r"^(?:运行|执行)\s+shell\s+命令[:：]?\s*(.+)$",
+        r"^(?:shell|cmd)[:：]\s*(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if match:
+            command = match.group(1).strip()
+            return command or None
+    return None
+
+
+def resolve_shell_arg(arg: str) -> str:
+    value = arg.strip()
+    if not value:
+        return value
+    for entry in DIRECTORY_ALIAS_ENTRIES:
+        if value == entry["alias"]:
+            return entry["path"]
+    return value
+
+
+def execute_shell_command(command_text: str) -> str:
+    if not ENABLE_SHELL_TOOL:
+        return "Shell 命令执行功能未启用，请先设置 `ENABLE_SHELL_TOOL=true`。"
+    if not SHELL_TOOL_WORKDIR.exists() or not SHELL_TOOL_WORKDIR.is_dir():
+        raise RuntimeError(f"shell workdir does not exist: {SHELL_TOOL_WORKDIR}")
+
+    try:
+        command_parts = shlex.split(command_text)
+    except ValueError as exc:
+        return f"命令解析失败: {exc}"
+
+    if not command_parts:
+        return "未提供可执行命令。"
+
+    executable = command_parts[0].lower()
+    if executable in SHELL_TOOL_BLOCKED_COMMANDS:
+        return f"出于安全限制，禁止执行命令: `{command_parts[0]}`"
+
+    resolved_command = [command_parts[0], *[resolve_shell_arg(arg) for arg in command_parts[1:]]]
+    logger.info("executing shell command command=%s", json.dumps(resolved_command, ensure_ascii=False))
+
+    try:
+        result = subprocess.run(
+            resolved_command,
+            cwd=str(SHELL_TOOL_WORKDIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=SHELL_TOOL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        return f"命令不存在: `{command_parts[0]}`"
+    except subprocess.TimeoutExpired:
+        return f"命令执行超时，已超过 {SHELL_TOOL_TIMEOUT_SECONDS:g} 秒。"
+    except Exception as exc:
+        logger.exception("failed to execute shell command")
+        return f"命令执行失败: {exc}"
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    output_parts = []
+    if stdout:
+        output_parts.append(stdout)
+    if stderr:
+        output_parts.append(f"[stderr]\n{stderr}")
+    output = "\n\n".join(output_parts).strip() or "[no output]"
+    if len(output) > SHELL_TOOL_MAX_OUTPUT_CHARS:
+        output = output[:SHELL_TOOL_MAX_OUTPUT_CHARS].rstrip() + "\n\n[输出已截断]"
+
+    return (
+        f"命令: `{command_text}`\n"
+        f"工作目录: `{SHELL_TOOL_WORKDIR}`\n"
+        f"退出码: {result.returncode}\n\n"
+        f"```text\n{output}\n```"
+    )
 
 
 def load_directory_aliases() -> list[dict[str, Any]]:
@@ -1548,8 +1715,24 @@ def chat_completions(request: ChatCompletionRequest) -> Any:
     if not latest_user.strip():
         raise HTTPException(status_code=400, detail="missing user message")
 
+    shell_command = detect_shell_command(latest_user)
+    model_name = request.model or CHAT_MODEL or "rag-model"
+    if shell_command is not None:
+        answer = execute_shell_command(shell_command)
+        if request.stream:
+            return build_streaming_response(answer, model_name)
+        return build_openai_response(answer, model_name)
+
     normalized_query = normalize_query(latest_user)
     scope = resolve_directory_scope(normalized_query or latest_user)
+    if is_directory_listing_query(normalized_query or latest_user, scope):
+        scoped = scope or {}
+        files = get_store().list_files_in_scope(scoped["path"])
+        answer = build_directory_listing_answer(scoped, files)
+        citations = [f"- {scoped['path']}"]
+        if request.stream:
+            return build_streaming_response(f"{answer}\n\nSources:\n" + "\n".join(citations), model_name)
+        return build_openai_response(f"{answer}\n\nSources:\n" + "\n".join(citations), model_name)
     scoped_query = (scope or {}).get("scoped_query", "")
     search_query = normalize_query(scoped_query) or normalized_query or latest_user
     path_ancestor = (scope or {}).get("path")
@@ -1582,7 +1765,6 @@ def chat_completions(request: ChatCompletionRequest) -> Any:
     for match in matches:
         citations.append(f"- {match.get('source_ref') or match['source_path']}")
 
-    model_name = request.model or CHAT_MODEL or "rag-model"
     if request.stream:
         stream = get_chat_service().complete_stream(llm_messages, request.temperature or 0.2)
         return proxy_streaming_response(stream, model_name, citations)

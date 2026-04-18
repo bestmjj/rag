@@ -83,6 +83,11 @@ services:
 
       # PDF extractor: `pymupdf` is usually much faster than `pypdf`.
       PDF_EXTRACTOR: ${PDF_EXTRACTOR:-pymupdf}
+      ENABLE_SHELL_TOOL: ${ENABLE_SHELL_TOOL:-false}
+      SHELL_TOOL_TIMEOUT_SECONDS: ${SHELL_TOOL_TIMEOUT_SECONDS:-15}
+      SHELL_TOOL_MAX_OUTPUT_CHARS: ${SHELL_TOOL_MAX_OUTPUT_CHARS:-12000}
+      SHELL_TOOL_WORKDIR: ${SHELL_TOOL_WORKDIR:-/kb}
+      SHELL_TOOL_BLOCKED_COMMANDS: ${SHELL_TOOL_BLOCKED_COMMANDS:-rm,mv,cp,chmod,chown,kill,pkill,shutdown,reboot,dd,mkfs,fdisk,mount,umount}
     volumes:
       # Host Kodbox storage mounted read-only into the container.
       - ${KB_HOST_PATH:-/data/kodbox/files}:${KB_ROOT:-/kb}:ro
