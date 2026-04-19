@@ -88,6 +88,10 @@ services:
       SHELL_TOOL_MAX_OUTPUT_CHARS: ${SHELL_TOOL_MAX_OUTPUT_CHARS:-12000}
       SHELL_TOOL_WORKDIR: ${SHELL_TOOL_WORKDIR:-/kb}
       SHELL_TOOL_BLOCKED_COMMANDS: ${SHELL_TOOL_BLOCKED_COMMANDS:-rm,mv,cp,chmod,chown,kill,pkill,shutdown,reboot,dd,mkfs,fdisk,mount,umount}
+      ENABLE_WEB_SEARCH: ${ENABLE_WEB_SEARCH:-false}
+      WEB_SEARCH_TIMEOUT_SECONDS: ${WEB_SEARCH_TIMEOUT_SECONDS:-12}
+      WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-5}
+      WEB_SEARCH_REGION: ${WEB_SEARCH_REGION:-cn-zh}
     volumes:
       # Host Kodbox storage mounted read-only into the container.
       - ${KB_HOST_PATH:-/data/kodbox/files}:${KB_ROOT:-/kb}:ro

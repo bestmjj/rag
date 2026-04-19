@@ -269,6 +269,33 @@ SHELL_TOOL_MAX_OUTPUT_CHARS=12000
 
 如果 `维瞰视界` 在 `DIRECTORY_ALIAS_MAP` 中映射到了 `工作/维瞰视界`，系统会自动替换为实际目录后执行。
 
+### 7. 启用联网检索
+
+`rag-api` 支持通过显式前缀触发联网检索，默认关闭。
+
+先在 `.env` 中开启：
+
+```env
+ENABLE_WEB_SEARCH=true
+WEB_SEARCH_TIMEOUT_SECONDS=12
+WEB_SEARCH_MAX_RESULTS=5
+WEB_SEARCH_REGION=cn-zh
+```
+
+使用方式：
+
+- `联网：今日ai热点`
+- `联网：当前伊美最新情况`
+- `联网：k8s 的 nodeselector`
+- `web: kubernetes nodeSelector`
+
+行为说明：
+
+- 只有显式使用 `联网：`、`联网搜索：`、`web:`、`search:` 前缀时才触发
+- 当前实现使用公开网页搜索结果做轻量汇总
+- 返回内容会附带来源链接
+- 如果联网失败，会返回失败提示，不影响普通知识库问答
+
 ## API
 
 - `GET /health`
@@ -297,6 +324,7 @@ SHELL_TOOL_MAX_OUTPUT_CHARS=12000
   - OpenAI-compatible 聊天接口
   - 支持普通返回和 `stream=true`
   - 开启 `ENABLE_SHELL_TOOL=true` 后，可识别 `执行命令 ...` 并返回命令输出
+  - 开启 `ENABLE_WEB_SEARCH=true` 后，可识别 `联网：...` 并执行联网检索
 
 - `feishu-bot: GET /health`
   - 飞书适配服务健康检查

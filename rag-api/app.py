@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import csv
 import logging
@@ -9,12 +10,13 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from docx import Document
 from fastapi import FastAPI, HTTPException
+import httpx
 from openpyxl import load_workbook
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -98,6 +100,14 @@ SHELL_TOOL_BLOCKED_COMMANDS = {
     ).split(",")
     if value.strip()
 }
+ENABLE_WEB_SEARCH = env_bool("ENABLE_WEB_SEARCH", False)
+WEB_SEARCH_TIMEOUT_SECONDS = float(os.getenv("WEB_SEARCH_TIMEOUT_SECONDS", "12"))
+WEB_SEARCH_MAX_RESULTS = env_int("WEB_SEARCH_MAX_RESULTS", 5)
+WEB_SEARCH_REGION = os.getenv("WEB_SEARCH_REGION", "cn-zh")
+WEB_SEARCH_USER_AGENT = os.getenv(
+    "WEB_SEARCH_USER_AGENT",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0 Safari/537.36",
+)
 
 app = FastAPI(title="lightweight-rag-api", version="0.1.0")
 logger = logging.getLogger("rag-api")
@@ -990,6 +1000,106 @@ def detect_shell_command(query: str) -> str | None:
     return None
 
 
+def detect_web_search_query(query: str) -> str | None:
+    text = query.strip()
+    if not text:
+        return None
+
+    patterns = [
+        r"^(?:请)?联网[:：]\s*(.+)$",
+        r"^(?:联网搜索|联网查询|搜索网页|搜索网络)[:：]\s*(.+)$",
+        r"^(?:web|search)[:：]\s*(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if match:
+            search_query = match.group(1).strip()
+            return search_query or None
+    return None
+
+
+def strip_html_tags(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value)
+    return normalize_text(html.unescape(text))
+
+
+def search_web(query: str) -> list[dict[str, str]]:
+    if not ENABLE_WEB_SEARCH:
+        return []
+
+    params = {"q": query, "kl": WEB_SEARCH_REGION}
+    headers = {"User-Agent": WEB_SEARCH_USER_AGENT}
+    urls = [
+        "https://html.duckduckgo.com/html/",
+        "https://duckduckgo.com/html/",
+    ]
+    last_error = None
+    html_text = ""
+    for url in urls:
+        try:
+            response = httpx.get(url, params=params, headers=headers, timeout=WEB_SEARCH_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            html_text = response.text
+            if html_text.strip():
+                break
+        except Exception as exc:
+            last_error = exc
+
+    if not html_text.strip():
+        if last_error is not None:
+            raise RuntimeError(f"web search failed: {last_error}") from last_error
+        return []
+
+    pattern = re.compile(
+        r'<a[^>]*class="[^\"]*result__a[^\"]*"[^>]*href="(?P<href>[^\"]+)"[^>]*>(?P<title>.*?)</a>(?P<tail>.*?)(?=<a[^>]*class="[^\"]*result__a|$)',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    snippet_pattern = re.compile(r'<a[^>]*class="[^\"]*result__snippet[^\"]*"[^>]*>(?P<snippet>.*?)</a>|<div[^>]*class="[^\"]*result__snippet[^\"]*"[^>]*>(?P<divsnippet>.*?)</div>', flags=re.IGNORECASE | re.DOTALL)
+
+    results = []
+    seen = set()
+    for match in pattern.finditer(html_text):
+        href = html.unescape(match.group("href")).strip()
+        title = strip_html_tags(match.group("title"))
+        tail = match.group("tail")
+        snippet_match = snippet_pattern.search(tail)
+        snippet_raw = ""
+        if snippet_match:
+            snippet_raw = snippet_match.group("snippet") or snippet_match.group("divsnippet") or ""
+        snippet = strip_html_tags(snippet_raw)
+        if not href or not title or href in seen:
+            continue
+        seen.add(href)
+        results.append({"title": title, "url": href, "snippet": snippet})
+        if len(results) >= WEB_SEARCH_MAX_RESULTS:
+            break
+    return results
+
+
+def build_web_search_answer(query: str, results: list[dict[str, str]], temperature: float) -> str:
+    if not results:
+        return "没有检索到可用的联网结果。"
+
+    web_context_lines = []
+    citations = []
+    for index, item in enumerate(results, start=1):
+        web_context_lines.append(
+            f"[Web {index}]\nTitle: {item['title']}\nURL: {item['url']}\nSnippet: {item['snippet'] or 'N/A'}"
+        )
+        citations.append(f"- {item['title']} ({item['url']})")
+
+    system_prompt = (
+        "You are a web-aware assistant. Answer the user's time-sensitive question using the provided web search results only. "
+        "If results are incomplete or conflicting, say so clearly. Keep the answer concise and in Chinese."
+    )
+    messages = [
+        {"role": "system", "content": system_prompt + "\n\nWeb Results:\n" + "\n\n".join(web_context_lines)},
+        {"role": "user", "content": query},
+    ]
+    answer = get_chat_service().complete(messages, temperature)
+    return f"{answer}\n\nSources:\n" + "\n".join(citations)
+
+
 def resolve_shell_arg(arg: str) -> str:
     value = arg.strip()
     if not value:
@@ -1719,6 +1829,18 @@ def chat_completions(request: ChatCompletionRequest) -> Any:
     model_name = request.model or CHAT_MODEL or "rag-model"
     if shell_command is not None:
         answer = execute_shell_command(shell_command)
+        if request.stream:
+            return build_streaming_response(answer, model_name)
+        return build_openai_response(answer, model_name)
+
+    web_search_query = detect_web_search_query(latest_user)
+    if web_search_query is not None:
+        try:
+            web_results = search_web(web_search_query)
+            answer = build_web_search_answer(web_search_query, web_results, request.temperature or 0.2)
+        except Exception:
+            logger.exception("failed to perform web search")
+            answer = "联网检索失败，请稍后重试。"
         if request.stream:
             return build_streaming_response(answer, model_name)
         return build_openai_response(answer, model_name)
